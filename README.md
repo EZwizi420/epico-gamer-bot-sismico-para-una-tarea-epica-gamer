@@ -1,4 +1,4 @@
-# Bot Sísmico Discord v1.0
+# Bot Sísmico Discord v1.0.1
 
 Incluye:
 - Alertas automáticas CSN 24/7.
@@ -31,3 +31,7 @@ Después del redeploy:
 La primera importación de un código crea su huella. Si luego ese mismo código cambia
 en la base, `/integridad` lo marca como MODIFICADA. Esto ayuda a auditar el experimento;
 no convierte las correlaciones en predicciones sísmicas científicamente validadas.
+
+
+## Corrección v1.0.1
+Corrige el SyntaxError de construcción del mensaje de alertas y muestra correctamente los checks 2/3.

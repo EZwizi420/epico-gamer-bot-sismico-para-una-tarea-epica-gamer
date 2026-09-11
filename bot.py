@@ -519,7 +519,7 @@ async def send_alerts_for_new_events(new_events):
 
             msg=(
                 ("@everyone\n🚨 **CORRELACIÓN SÍSMICA DETECTADA**\n\n" if level=="COINCIDENCIA"
-                 else "🟡 **CASI COINCIDENCIA SÍSMICA (2/3 filtros)**\n\n")
+                 else "🟡 **CASI COINCIDENCIA SÍSMICA (2/3 filtros)**\n\n") +
                 "🌐 **Sismo observado por el CSN**\n"
                 f"📅 Fecha: **{when:%d/%m/%Y}**\n"
                 f"🕒 Hora local: **{when:%H:%M:%S}**\n"
@@ -536,7 +536,9 @@ async def send_alerts_for_new_events(new_events):
                 f"📍 Lugar predicho: **{p['place']}**\n"
                 f"📏 Distancia a referencia: **{check['dist']:.1f} km** "
                 f"(radio permitido {check['radius']} km)\n\n"
-                "Filtros: Tiempo ✅ · Magnitud ✅ · Ubicación ✅"
+                f"Filtros: Tiempo {'✅' if check['time'] else '❌'} · "
+                f"Magnitud {'✅' if check['mag'] else '❌'} · "
+                f"Ubicación {'✅' if check['geo'] else '❌'}"
             )
             if e["source_url"]:
                 msg += f"\n🔗 **Informe oficial CSN:**\n{e['source_url']}"
