@@ -1472,7 +1472,7 @@ async def c_ayuda(i:discord.Interaction):
 
 @bot.tree.command(name="raiz",description="Calcula una raíz de forma directa")
 @app_commands.describe(numero="Número",indice="2=cuadrada, 3=cúbica, etc.")
-async def c_raiz(i:discord.Interaction,numero:float,indice:float=2):
+async def c_raiz(i:discord.Interaction,numero:float,indice:float=2.0):
     if indice==0:
         await i.response.send_message("❌ El índice no puede ser 0.",ephemeral=True)
         return
