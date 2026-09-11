@@ -1,5 +1,5 @@
 import ast
-import os, re, math, sqlite3
+import os, re, math, sqlite3, hashlib
 from datetime import datetime, date, time, timedelta
 from pathlib import Path
 
@@ -15,6 +15,13 @@ EXCEL_PATH = os.getenv("EXCEL_PATH", "Proyecto_Tabla_de_datos_con_coordenadas.xl
 DB_PATH = os.getenv("DB_PATH", "bot_sismico.db")
 CHECK_MINUTES = int(os.getenv("CSN_CHECK_MINUTES", "5"))
 DEFAULT_MARGIN_HOURS = 2
+
+def parse_datetime(value):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value)
+    raise TypeError(f"fecha/hora inválida: {type(value).__name__}")
 
 def connect():
     con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row; return con
@@ -174,7 +181,7 @@ def evaluate(p,es,hours):
     lo=p["magnitude"]-p["mag_margin"];hi=p["magnitude"]+p["mag_margin"];rad=radius(p["magnitude"],p["zone_type"])
     matches=[];cands=[]
     for e in es:
-        when=datetime.fromisoformat(e["occurred_at"]);dist=haversine(p["latitude"],p["longitude"],e["latitude"],e["longitude"])
+        when=parse_datetime(e["occurred_at"]);dist=haversine(p["latitude"],p["longitude"],e["latitude"],e["longitude"])
         x={"e":e,"t":start<=when<=end,"m":lo<=e["magnitude"]<=hi,"g":dist<=rad,
            "dist":dist,"mins":abs((when-target).total_seconds())/60,"dmag":abs(e["magnitude"]-p["magnitude"])}
         cands.append(x)
@@ -352,7 +359,7 @@ def evaluate_real(p, es):
     matches, candidates = [], []
 
     for e in es:
-        when = datetime.fromisoformat(e["occurred_at"])
+        when = parse_datetime(e["occurred_at"])
         dist = haversine(p["latitude"],p["longitude"],e["latitude"],e["longitude"])
         t_ok = real_time_ok(when,p)
         m_ok = p["mag_min"] <= e["magnitude"] <= p["mag_max"]
@@ -475,7 +482,7 @@ def mark_alert_sent(event_id, prediction_code):
         )
 
 def event_matches_real_prediction(e, p):
-    when=datetime.fromisoformat(e["occurred_at"])
+    when=parse_datetime(e["occurred_at"])
     rad=radius((p["mag_min"]+p["mag_max"])/2,p["zone_type"])
     dist=haversine(p["latitude"],p["longitude"],e["latitude"],e["longitude"])
     return {
@@ -501,7 +508,7 @@ async def send_alerts_for_new_events(new_events):
     sent=0
 
     for e in new_events:
-        when=datetime.fromisoformat(e["occurred_at"])
+        when=parse_datetime(e["occurred_at"])
         for p in predictions:
             check=event_matches_real_prediction(e,p)
 
@@ -641,7 +648,7 @@ async def c_ver(i:discord.Interaction,codigo:str,margen_horas:app_commands.Range
           f"({p['latitude']:.4f}, {p['longitude']:.4f})\n📈 M{p['magnitude']:.1f} ±{p['mag_margin']:.1f} "
           f"→ M{lo:.1f}–M{hi:.1f}\n📏 Radio: {rad} km\n⏱️ Ventana: {start:%d/%m %H:%M}–{end:%d/%m %H:%M}")
     if b:
-        e=b["e"];when=datetime.fromisoformat(e["occurred_at"])
+        e=b["e"];when=parse_datetime(e["occurred_at"])
         text+=(f"\n\n🌐 **Evento CSN #{e['source_id']}**\n{when:%d/%m/%Y %H:%M:%S} · M{e['magnitude']:.1f}\n"
                f"{e['place']}\n📍 {e['latitude']:.4f}, {e['longitude']:.4f}\n"
                f"Distancia **{b['dist']:.1f} km** · Δt **{b['mins']:.0f} min** · ΔM **{b['dmag']:.2f}**\n"
@@ -741,7 +748,7 @@ async def c_last_csn(i: discord.Interaction):
 
     lines = ["🌐 **ÚLTIMOS EVENTOS CSN GUARDADOS**"]
     for e in rows:
-        when = datetime.fromisoformat(e["occurred_at"])
+        when = parse_datetime(e["occurred_at"])
         depth = f" · {e['depth_km']:.1f} km prof." if e["depth_km"] is not None else ""
         lines.append(
             f"**#{e['source_id']}** · {when:%d/%m/%Y %H:%M:%S} · "
@@ -884,7 +891,7 @@ async def c_ver_real(i:discord.Interaction,codigo:str):
 
     if chosen:
         e=chosen["e"]
-        when=datetime.fromisoformat(e["occurred_at"])
+        when=parse_datetime(e["occurred_at"])
         text+=(
             f"\n\n{chosen_title}\n"
             f"📅 {when:%d/%m/%Y %H:%M:%S}\n"
@@ -1393,7 +1400,7 @@ class CalculatorView(discord.ui.View):
     async def normal(self,interaction,button):
         await interaction.response.send_modal(BasicCalcModal())
 
-    @discord.ui.button(label="Raíz",emoji="√",style=discord.ButtonStyle.primary,row=0)
+    @discord.ui.button(label="Raíz",style=discord.ButtonStyle.primary,row=0)
     async def root(self,interaction,button):
         await interaction.response.send_modal(RootModal())
 
