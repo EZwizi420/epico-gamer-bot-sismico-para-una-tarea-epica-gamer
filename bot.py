@@ -165,7 +165,7 @@ def save_csn_event(e):
          e["latitude"],e["longitude"],e.get("depth_km"),e.get("url")))
         return con.total_changes>before
 
-def update_csn(limit=30):
+def update_csn(limit=None):
     events,errors=fetch_recent_events(limit)
     new=0
     for e in events:new+=1 if save_csn_event(e) else 0
@@ -174,7 +174,7 @@ def update_csn(limit=30):
 def preds():
     with connect() as con:return con.execute("SELECT * FROM predictions WHERE group_name='PRUEBA' ORDER BY predicted_at").fetchall()
 def events():
-    with connect() as con:return con.execute("SELECT * FROM observed_events WHERE source='CSN' ORDER BY occurred_at").fetchall()
+    with connect() as con:return con.execute("SELECT * FROM observed_events WHERE source='CSN' ORDER BY occurred_at DESC").fetchall()
 
 def evaluate(p,es,hours):
     target=datetime.fromisoformat(p["predicted_at"]);start=target-timedelta(hours=hours);end=target+timedelta(hours=hours)
@@ -576,7 +576,7 @@ bot=commands.Bot(command_prefix="!",intents=intents)
 @tasks.loop(minutes=CHECK_MINUTES)
 async def csn_loop():
     try:
-        fetched,errs=fetch_recent_events(30)
+        fetched,errs=fetch_recent_events()
         newly_saved=[]
         for e in fetched:
             if save_csn_event(e):
@@ -661,6 +661,37 @@ async def c_state(i:discord.Interaction):
         row=con.execute("SELECT COUNT(*) n, MAX(occurred_at) last FROM observed_events WHERE source='CSN'").fetchone()
     await i.response.send_message(f"🌐 Eventos CSN guardados: **{row['n']}**\nÚltimo: **{row['last'] or 'ninguno'}**")
 
+
+@bot.tree.command(name="csn_diagnostico",description="Compara el catálogo actual del CSN con la base local del bot")
+async def c_csn_diag(i:discord.Interaction):
+    await i.response.defer(ephemeral=True)
+    try:
+        fetched,errs=fetch_recent_events()
+        remote={str(e["source_id"]):e for e in fetched}
+        with connect() as con:
+            rows=con.execute("SELECT source_id,occurred_at,place,magnitude FROM observed_events WHERE source='CSN'").fetchall()
+        local={str(r["source_id"]):r for r in rows}
+        missing=[e for sid,e in remote.items() if sid not in local]
+        latest_web=max(fetched,key=lambda e:e["occurred_at"]) if fetched else None
+        latest_db=max(rows,key=lambda r:parse_datetime(r["occurred_at"])) if rows else None
+        synced=(len(missing)==0)
+        e=ui_embed("📡 Diagnóstico CSN",color=(discord.Color.green() if synced else discord.Color.red()))
+        e.add_field(name="Catálogo hoy + ayer",value=f"**{len(fetched)}** eventos",inline=True)
+        e.add_field(name="Faltantes en SQLite",value=f"**{len(missing)}**",inline=True)
+        e.add_field(name="Estado",value=("🟢 Sincronizado" if synced else "🔴 Desactualizado"),inline=True)
+        if latest_web:
+            e.add_field(name="🌐 Último en CSN",value=f"{latest_web['occurred_at']:%d/%m/%Y %H:%M:%S} · M{latest_web['magnitude']:.1f}\n{latest_web['place']}",inline=False)
+        if latest_db:
+            dt=parse_datetime(latest_db["occurred_at"])
+            e.add_field(name="💾 Último guardado",value=f"{dt:%d/%m/%Y %H:%M:%S} · M{latest_db['magnitude']:.1f}\n{latest_db['place']}",inline=False)
+        if missing:
+            sample=missing[:5]
+            e.add_field(name="⚠️ Ejemplos faltantes",value="\n".join(f"• {x['occurred_at']:%H:%M:%S} M{x['magnitude']:.1f} — {x['place']}" for x in sample),inline=False)
+        if errs:
+            e.add_field(name="Avisos del parser",value=f"{len(errs)} aviso(s). Primero: {errs[0][:300]}",inline=False)
+        await i.followup.send(embed=e,ephemeral=True)
+    except Exception as exc:
+        await i.followup.send(f"❌ Diagnóstico CSN falló: `{exc}`",ephemeral=True)
 
 def parse_user_date(text):
     for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
