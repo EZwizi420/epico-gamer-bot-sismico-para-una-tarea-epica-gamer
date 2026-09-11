@@ -1179,6 +1179,316 @@ async def c_radio(i:discord.Interaction,magnitud:float,tipo_zona:str=""):
     )
 
 
+
+# ---------- V1.2: INTERFAZ VISUAL ----------
+
+def ui_embed(title, description="", color=discord.Color.blurple()):
+    return discord.Embed(title=title, description=description, color=color)
+
+def fmt_bool(v):
+    return "✅ Cumple" if v else "❌ No cumple"
+
+def build_status_embed():
+    channel_id=get_setting("alert_channel_id")
+    with connect() as con:
+        n_events=con.execute("SELECT COUNT(*) FROM observed_events").fetchone()[0]
+        n_preds=con.execute("SELECT COUNT(*) FROM real_predictions").fetchone()[0]
+        n_corr=con.execute("SELECT COUNT(*) FROM correlation_history").fetchone()[0]
+    e=ui_embed("⚙️ Estado del Bot Sísmico","Resumen rápido del sistema.")
+    e.add_field(name="🌐 CSN",value=f"Consulta cada **{CHECK_MINUTES} min**",inline=True)
+    e.add_field(name="🎯 Predicciones",value=f"**{n_preds}** guardadas",inline=True)
+    e.add_field(name="🌎 Eventos CSN",value=f"**{n_events}** guardados",inline=True)
+    e.add_field(name="📑 Correlaciones",value=f"**{n_corr}** registradas",inline=True)
+    e.add_field(name="🔔 Canal de alertas",value=(f"<#{channel_id}>" if channel_id else "No configurado"),inline=True)
+    e.add_field(name="💾 Persistencia",value=("`"+DB_PATH+"`"),inline=True)
+    e.set_footer(text="CSN + predicciones • v1.2")
+    return e
+
+def build_ranking_embed():
+    ps=get_real_group()
+    es=events()
+    groups={}
+    for p in ps:
+        groups.setdefault(p["group_name"],[]).append(p)
+    rows=[]
+    for group,gps in groups.items():
+        hits=misses=pending=0
+        for p in gps:
+            st,_,_,_=evaluate_real(p,es)
+            if st=="ACERTADA": hits+=1
+            elif st=="NO ACERTADA": misses+=1
+            else: pending+=1
+        closed=hits+misses
+        pct=(100*hits/closed) if closed else None
+        rows.append((pct if pct is not None else -1,group,hits,misses,pending))
+    rows.sort(reverse=True)
+    e=ui_embed("🏆 Ranking por IA","Resultados cerrados; las pendientes no cuentan en el porcentaje.")
+    if not rows:
+        e.description="Todavía no hay predicciones importadas."
+        return e
+    medals=["🥇","🥈","🥉"]
+    for idx,(pct,g,h,m,pending) in enumerate(rows[:10]):
+        icon=medals[idx] if idx<3 else "▫️"
+        score=f"{pct:.1f}%" if pct>=0 else "—"
+        e.add_field(
+            name=f"{icon} {g} · {score}",
+            value=f"✅ {h}  •  ❌ {m}  •  🟡 {pending}",
+            inline=False
+        )
+    return e
+
+def build_history_embed():
+    with connect() as con:
+        rows=con.execute("""SELECT * FROM correlation_history
+                            ORDER BY detected_at DESC LIMIT 8""").fetchall()
+    e=ui_embed("📑 Historial de correlaciones","Últimas coincidencias registradas automáticamente.")
+    if not rows:
+        e.description="Todavía no hay correlaciones guardadas."
+        return e
+    for r in rows:
+        icon="🚨" if r["match_level"]=="COINCIDENCIA" else "🟡"
+        when=datetime.fromisoformat(r["event_time"])
+        e.add_field(
+            name=f"{icon} {r['prediction_code']} ↔ CSN #{r['event_source_id']}",
+            value=f"📅 {when:%d/%m/%Y %H:%M}  •  📈 M{r['event_mag']:.1f}  •  📏 {r['distance_km']:.1f} km",
+            inline=False
+        )
+    return e
+
+def build_help_embed():
+    e=ui_embed(
+        "❓ Centro de ayuda",
+        "Usa `/panel` como menú principal. Los comandos antiguos siguen funcionando."
+    )
+    e.add_field(name="🎯 Predicciones",value="`/ver_real` · `/analizar_grupo` · `/analizar_todos` · `/importar_todos`",inline=False)
+    e.add_field(name="🌐 CSN",value="`/actualizar_csn` · `/importar_historico` · `/ultimos_csn`",inline=False)
+    e.add_field(name="🧮 Calculadora",value="Desde `/panel` → **Calculadora**, o `/calcular`, `/distancia`, `/comparar`, `/radio`.",inline=False)
+    e.add_field(name="📊 Resultados",value="`/ranking` · `/historial` · `/integridad`",inline=False)
+    e.add_field(name="🔔 Alertas",value="`/canal_alertas` · `/estado_alertas` · `/desactivar_alertas`",inline=False)
+    e.set_footer(text="Los botones del panel no modifican predicciones por sí solos.")
+    return e
+
+class BasicCalcModal(discord.ui.Modal, title="🧮 Calculadora"):
+    expression=discord.ui.TextInput(
+        label="Expresión",
+        placeholder="Ej.: 25**(1/2)  o  (25*3)+10",
+        max_length=100
+    )
+    async def on_submit(self, interaction):
+        try:
+            result=safe_calculate(str(self.expression))
+            shown=f"{result:.10g}" if isinstance(result,float) else str(result)
+            e=ui_embed("🧮 Resultado",f"`{self.expression}`\n\n### = **{shown}**",discord.Color.green())
+            await interaction.response.send_message(embed=e,ephemeral=True)
+        except Exception as exc:
+            await interaction.response.send_message(f"❌ Expresión no válida: `{exc}`",ephemeral=True)
+
+class RootModal(discord.ui.Modal, title="√ Calculadora de raíces"):
+    number=discord.ui.TextInput(label="Número",placeholder="Ej.: 25")
+    index=discord.ui.TextInput(label="Índice de la raíz",placeholder="2 = cuadrada, 3 = cúbica",default="2")
+    async def on_submit(self, interaction):
+        try:
+            x=float(str(self.number).replace(",","."))
+            n=float(str(self.index).replace(",","."))
+            if n==0: raise ValueError("el índice no puede ser 0")
+            if x<0 and abs(n-round(n))<1e-9 and int(round(n))%2==1:
+                result=-((-x)**(1/n))
+            elif x<0:
+                raise ValueError("esta calculadora usa resultados reales; esa raíz no es real")
+            else:
+                result=x**(1/n)
+            e=ui_embed("√ Resultado",f"Raíz **{n:g}** de **{x:g}**\n\n### = **{result:.10g}**",discord.Color.green())
+            await interaction.response.send_message(embed=e,ephemeral=True)
+        except Exception as exc:
+            await interaction.response.send_message(f"❌ No pude calcularla: `{exc}`",ephemeral=True)
+
+class DistanceModal(discord.ui.Modal, title="🌎 Distancia entre coordenadas"):
+    lat1=discord.ui.TextInput(label="Latitud punto 1",placeholder="-33.05")
+    lon1=discord.ui.TextInput(label="Longitud punto 1",placeholder="-71.62")
+    lat2=discord.ui.TextInput(label="Latitud punto 2",placeholder="-33.18")
+    lon2=discord.ui.TextInput(label="Longitud punto 2",placeholder="-71.74")
+    async def on_submit(self, interaction):
+        try:
+            a,b,c,d=[float(str(x).replace(",",".")) for x in (self.lat1,self.lon1,self.lat2,self.lon2)]
+            if not (-90<=a<=90 and -90<=c<=90 and -180<=b<=180 and -180<=d<=180):
+                raise ValueError("coordenadas fuera de rango")
+            km=haversine(a,b,c,d)
+            e=ui_embed("🌎 Distancia geográfica",f"📍 `{a:.5f}, {b:.5f}`\n📍 `{c:.5f}, {d:.5f}`\n\n### 📏 **{km:.2f} km**")
+            await interaction.response.send_message(embed=e,ephemeral=True)
+        except Exception as exc:
+            await interaction.response.send_message(f"❌ Datos no válidos: `{exc}`",ephemeral=True)
+
+class MagnitudeModal(discord.ui.Modal, title="📈 Comparar magnitud"):
+    predicted=discord.ui.TextInput(label="Magnitud predicha",placeholder="4.2")
+    margin=discord.ui.TextInput(label="Margen ±",placeholder="0.3")
+    observed=discord.ui.TextInput(label="Magnitud CSN",placeholder="4.4")
+    async def on_submit(self, interaction):
+        try:
+            pred=float(str(self.predicted).replace(",","."))
+            margin=abs(float(str(self.margin).replace(",",".")))
+            obs=float(str(self.observed).replace(",","."))
+            lo,hi=pred-margin,pred+margin
+            ok=lo<=obs<=hi
+            e=ui_embed("📈 Comparación de magnitud",color=(discord.Color.green() if ok else discord.Color.red()))
+            e.add_field(name="Predicción",value=f"M{pred:.2f} ±{margin:.2f}\n`M{lo:.2f}–M{hi:.2f}`",inline=True)
+            e.add_field(name="CSN",value=f"**M{obs:.2f}**",inline=True)
+            e.add_field(name="Diferencia",value=f"**{abs(obs-pred):.2f}**",inline=True)
+            e.add_field(name="Resultado",value=fmt_bool(ok),inline=False)
+            await interaction.response.send_message(embed=e,ephemeral=True)
+        except Exception as exc:
+            await interaction.response.send_message(f"❌ Datos no válidos: `{exc}`",ephemeral=True)
+
+class TimeModal(discord.ui.Modal, title="🕒 Comparar tiempo"):
+    predicted=discord.ui.TextInput(label="Fecha/hora predicha",placeholder="11/09/2026 18:30")
+    observed=discord.ui.TextInput(label="Fecha/hora del sismo",placeholder="11/09/2026 19:45")
+    margin=discord.ui.TextInput(label="Margen permitido (horas)",placeholder="2")
+    async def on_submit(self, interaction):
+        try:
+            a=datetime.strptime(str(self.predicted).strip(),"%d/%m/%Y %H:%M")
+            b=datetime.strptime(str(self.observed).strip(),"%d/%m/%Y %H:%M")
+            m=abs(float(str(self.margin).replace(",",".")))
+            delta=abs((b-a).total_seconds())/3600
+            ok=delta<=m
+            e=ui_embed("🕒 Comparación temporal",color=(discord.Color.green() if ok else discord.Color.red()))
+            e.add_field(name="Diferencia",value=f"**{delta:.2f} h**\n{delta*60:.0f} min",inline=True)
+            e.add_field(name="Margen",value=f"± **{m:.2f} h**",inline=True)
+            e.add_field(name="Resultado",value=fmt_bool(ok),inline=False)
+            await interaction.response.send_message(embed=e,ephemeral=True)
+        except Exception:
+            await interaction.response.send_message("❌ Usa fechas con formato `DD/MM/AAAA HH:MM` y un margen numérico.",ephemeral=True)
+
+class FullCompareModal(discord.ui.Modal, title="🎯 Comparación completa"):
+    magnitudes=discord.ui.TextInput(label="Magnitud: predicha,margen,real",placeholder="4.2,0.3,4.4")
+    geography=discord.ui.TextInput(label="Ubicación: distancia,radio (km)",placeholder="18,25")
+    timing=discord.ui.TextInput(label="Tiempo: diferencia,margen (horas)",placeholder="1.5,2")
+    async def on_submit(self, interaction):
+        try:
+            pred,mm,obs=[float(x.strip().replace(",",".")) for x in str(self.magnitudes).replace(";",",").split(",")]
+            dist,rad=[float(x.strip().replace(",",".")) for x in str(self.geography).replace(";",",").split(",")]
+            dh,mh=[float(x.strip().replace(",",".")) for x in str(self.timing).replace(";",",").split(",")]
+            mm,mh,rad=abs(mm),abs(mh),abs(rad)
+            mag_ok=pred-mm<=obs<=pred+mm
+            geo_ok=dist<=rad
+            time_ok=abs(dh)<=mh
+            passed=sum((mag_ok,geo_ok,time_ok))
+            title="✅ Coincidencia 3/3" if passed==3 else ("🟡 Casi coincidencia 2/3" if passed==2 else f"❌ No coincide ({passed}/3)")
+            color=discord.Color.green() if passed==3 else (discord.Color.gold() if passed==2 else discord.Color.red())
+            e=ui_embed(title,color=color)
+            e.add_field(name="📈 Magnitud",value=f"{fmt_bool(mag_ok)}\nM{obs:.2f} vs M{pred-mm:.2f}–M{pred+mm:.2f}",inline=False)
+            e.add_field(name="📍 Ubicación",value=f"{fmt_bool(geo_ok)}\n{dist:.2f} / {rad:.2f} km",inline=False)
+            e.add_field(name="🕒 Tiempo",value=f"{fmt_bool(time_ok)}\n{abs(dh):.2f} / {mh:.2f} h",inline=False)
+            await interaction.response.send_message(embed=e,ephemeral=True)
+        except Exception:
+            await interaction.response.send_message(
+                "❌ Formato incorrecto. Ejemplos:\n"
+                "Magnitud: `4.2,0.3,4.4`\nUbicación: `18,25`\nTiempo: `1.5,2`",
+                ephemeral=True
+            )
+
+class CalculatorView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=900)
+
+    @discord.ui.button(label="Normal",emoji="🧮",style=discord.ButtonStyle.primary,row=0)
+    async def normal(self,interaction,button):
+        await interaction.response.send_modal(BasicCalcModal())
+
+    @discord.ui.button(label="Raíz",emoji="√",style=discord.ButtonStyle.primary,row=0)
+    async def root(self,interaction,button):
+        await interaction.response.send_modal(RootModal())
+
+    @discord.ui.button(label="Distancia",emoji="🌎",style=discord.ButtonStyle.secondary,row=0)
+    async def distance(self,interaction,button):
+        await interaction.response.send_modal(DistanceModal())
+
+    @discord.ui.button(label="Magnitud",emoji="📈",style=discord.ButtonStyle.secondary,row=1)
+    async def magnitude(self,interaction,button):
+        await interaction.response.send_modal(MagnitudeModal())
+
+    @discord.ui.button(label="Tiempo",emoji="🕒",style=discord.ButtonStyle.secondary,row=1)
+    async def timing(self,interaction,button):
+        await interaction.response.send_modal(TimeModal())
+
+    @discord.ui.button(label="Comparación 3/3",emoji="🎯",style=discord.ButtonStyle.success,row=1)
+    async def compare(self,interaction,button):
+        await interaction.response.send_modal(FullCompareModal())
+
+class MainPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=900)
+
+    @discord.ui.button(label="Estado",emoji="⚙️",style=discord.ButtonStyle.primary,row=0)
+    async def status(self,interaction,button):
+        await interaction.response.send_message(embed=build_status_embed(),ephemeral=True)
+
+    @discord.ui.button(label="Ranking",emoji="🏆",style=discord.ButtonStyle.primary,row=0)
+    async def ranking(self,interaction,button):
+        await interaction.response.send_message(embed=build_ranking_embed(),ephemeral=True)
+
+    @discord.ui.button(label="Historial",emoji="📑",style=discord.ButtonStyle.secondary,row=0)
+    async def history(self,interaction,button):
+        await interaction.response.send_message(embed=build_history_embed(),ephemeral=True)
+
+    @discord.ui.button(label="Calculadora",emoji="🧮",style=discord.ButtonStyle.success,row=1)
+    async def calculator(self,interaction,button):
+        e=ui_embed(
+            "🧮 Centro de cálculo",
+            "Elige qué quieres calcular. Los resultados aparecen solo para ti."
+        )
+        await interaction.response.send_message(embed=e,view=CalculatorView(),ephemeral=True)
+
+    @discord.ui.button(label="Actualizar CSN",emoji="🌐",style=discord.ButtonStyle.secondary,row=1)
+    async def update_csn_button(self,interaction,button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            total,new,errs=update_csn()
+            e=ui_embed("🌐 CSN actualizado",f"Informes leídos: **{total}**\nNuevos guardados: **{new}**",discord.Color.green())
+            if errs:
+                e.add_field(name="⚠️ Avisos",value=f"{len(errs)} informe(s) no pudieron interpretarse.",inline=False)
+            await interaction.followup.send(embed=e,ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Error consultando CSN: `{exc}`",ephemeral=True)
+
+    @discord.ui.button(label="Ayuda",emoji="❓",style=discord.ButtonStyle.secondary,row=1)
+    async def help(self,interaction,button):
+        await interaction.response.send_message(embed=build_help_embed(),ephemeral=True)
+
+@bot.tree.command(name="panel",description="Abre el panel visual del Bot Sísmico")
+async def c_panel(i:discord.Interaction):
+    e=ui_embed(
+        "🌎 Bot Sísmico · Panel principal",
+        "Controla las funciones más usadas sin memorizar comandos.\n\n"
+        "🎯 **Predicciones y CSN** continúan usando el mismo motor y la misma base de datos."
+    )
+    e.add_field(name="📊 Resultados",value="Estado, ranking e historial",inline=True)
+    e.add_field(name="🧮 Herramientas",value="Calculadora, raíces y comparaciones",inline=True)
+    e.add_field(name="🌐 Datos",value="Actualización manual del CSN",inline=True)
+    e.set_footer(text="Panel v1.2 • Los botones duran 15 minutos")
+    await i.response.send_message(embed=e,view=MainPanel())
+
+@bot.tree.command(name="ayuda",description="Muestra una guía limpia de los comandos del bot")
+async def c_ayuda(i:discord.Interaction):
+    await i.response.send_message(embed=build_help_embed(),ephemeral=True)
+
+@bot.tree.command(name="raiz",description="Calcula una raíz de forma directa")
+@app_commands.describe(numero="Número",indice="2=cuadrada, 3=cúbica, etc.")
+async def c_raiz(i:discord.Interaction,numero:float,indice:float=2):
+    if indice==0:
+        await i.response.send_message("❌ El índice no puede ser 0.",ephemeral=True)
+        return
+    try:
+        if numero<0 and abs(indice-round(indice))<1e-9 and int(round(indice))%2==1:
+            result=-((-numero)**(1/indice))
+        elif numero<0:
+            raise ValueError("esa raíz no tiene resultado real")
+        else:
+            result=numero**(1/indice)
+        e=ui_embed("√ Resultado",f"Raíz **{indice:g}** de **{numero:g}**\n\n### = **{result:.10g}**",discord.Color.green())
+        await i.response.send_message(embed=e)
+    except Exception as exc:
+        await i.response.send_message(f"❌ No pude calcularla: `{exc}`",ephemeral=True)
+
+
 init_db()
 if __name__=="__main__":
     if not TOKEN:raise SystemExit("Configura DISCORD_TOKEN.")
