@@ -1420,57 +1420,227 @@ class CalculatorView(discord.ui.View):
     async def compare(self,interaction,button):
         await interaction.response.send_modal(FullCompareModal())
 
-class MainPanel(discord.ui.View):
+class PredictionsPanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=900)
 
-    @discord.ui.button(label="Estado",emoji="⚙️",style=discord.ButtonStyle.primary,row=0)
-    async def status(self,interaction,button):
-        await interaction.response.send_message(embed=build_status_embed(),ephemeral=True)
+    @discord.ui.button(label="Resumen", emoji="🎯", style=discord.ButtonStyle.primary, row=0)
+    async def summary(self, interaction, button):
+        ps=get_real_group()
+        es=events()
+        hit=miss=pending=0
+        for p in ps:
+            st,_,_,_=evaluate_real(p,es)
+            if st=="ACERTADA": hit+=1
+            elif st=="NO ACERTADA": miss+=1
+            else: pending+=1
+        e=ui_embed("🎯 Predicciones")
+        e.add_field(name="Total",value=f"**{len(ps)}**",inline=True)
+        e.add_field(name="✅ Acertadas",value=f"**{hit}**",inline=True)
+        e.add_field(name="❌ No acertadas",value=f"**{miss}**",inline=True)
+        e.add_field(name="🟡 Pendientes",value=f"**{pending}**",inline=True)
+        await interaction.response.send_message(embed=e,ephemeral=True)
 
-    @discord.ui.button(label="Ranking",emoji="🏆",style=discord.ButtonStyle.primary,row=0)
-    async def ranking(self,interaction,button):
+    @discord.ui.button(label="Ranking", emoji="🏆", style=discord.ButtonStyle.secondary, row=0)
+    async def ranking(self, interaction, button):
         await interaction.response.send_message(embed=build_ranking_embed(),ephemeral=True)
 
-    @discord.ui.button(label="Historial",emoji="📑",style=discord.ButtonStyle.secondary,row=0)
-    async def history(self,interaction,button):
+    @discord.ui.button(label="Historial", emoji="📑", style=discord.ButtonStyle.secondary, row=0)
+    async def history(self, interaction, button):
         await interaction.response.send_message(embed=build_history_embed(),ephemeral=True)
 
-    @discord.ui.button(label="Calculadora",emoji="🧮",style=discord.ButtonStyle.success,row=1)
-    async def calculator(self,interaction,button):
-        e=ui_embed(
-            "🧮 Centro de cálculo",
-            "Elige qué quieres calcular. Los resultados aparecen solo para ti."
-        )
-        await interaction.response.send_message(embed=e,view=CalculatorView(),ephemeral=True)
+    @discord.ui.button(label="Integridad", emoji="🔒", style=discord.ButtonStyle.secondary, row=1)
+    async def integrity(self, interaction, button):
+        ps=get_real_group()
+        ok=changed=unfrozen=0
+        for p in ps:
+            st,_=integrity_status(p)
+            if st=="OK": ok+=1
+            elif st=="MODIFICADA": changed+=1
+            else: unfrozen+=1
+        e=ui_embed("🔒 Integridad de predicciones")
+        e.add_field(name="✅ Sin cambios",value=str(ok),inline=True)
+        e.add_field(name="⚠️ Modificadas",value=str(changed),inline=True)
+        e.add_field(name="🧊 Sin congelar",value=str(unfrozen),inline=True)
+        await interaction.response.send_message(embed=e,ephemeral=True)
 
-    @discord.ui.button(label="Actualizar CSN",emoji="🌐",style=discord.ButtonStyle.secondary,row=1)
-    async def update_csn_button(self,interaction,button):
+class CSNPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=900)
+
+    @discord.ui.button(label="Últimos sismos", emoji="🌎", style=discord.ButtonStyle.primary, row=0)
+    async def latest(self, interaction, button):
+        es=events()[:8]
+        e=ui_embed("🌎 Últimos sismos guardados")
+        if not es:
+            e.description="No hay eventos CSN guardados todavía."
+        for x in es:
+            try:
+                when=parse_datetime(x["occurred_at"])
+                when_txt=when.strftime("%d/%m/%Y %H:%M:%S")
+            except Exception:
+                when_txt=str(x["occurred_at"])
+            e.add_field(
+                name=f"M{x['magnitude']:.1f} · {when_txt}",
+                value=f"📍 {x['place']}\n📐 {x['latitude']:.3f}, {x['longitude']:.3f}",
+                inline=False
+            )
+        await interaction.response.send_message(embed=e,ephemeral=True)
+
+    @discord.ui.button(label="Actualizar ahora", emoji="🔄", style=discord.ButtonStyle.success, row=0)
+    async def update_now(self, interaction, button):
         await interaction.response.defer(ephemeral=True)
         try:
             total,new,errs=update_csn()
-            e=ui_embed("🌐 CSN actualizado",f"Informes leídos: **{total}**\nNuevos guardados: **{new}**",discord.Color.green())
-            if errs:
-                e.add_field(name="⚠️ Avisos",value=f"{len(errs)} informe(s) no pudieron interpretarse.",inline=False)
+            e=ui_embed("🌐 CSN actualizado",color=discord.Color.green())
+            e.add_field(name="Leídos",value=str(total),inline=True)
+            e.add_field(name="Nuevos",value=str(new),inline=True)
+            e.add_field(name="Avisos",value=str(len(errs)),inline=True)
             await interaction.followup.send(embed=e,ephemeral=True)
         except Exception as exc:
             await interaction.followup.send(f"❌ Error consultando CSN: `{exc}`",ephemeral=True)
 
-    @discord.ui.button(label="Ayuda",emoji="❓",style=discord.ButtonStyle.secondary,row=1)
+    @discord.ui.button(label="Estado CSN", emoji="📡", style=discord.ButtonStyle.secondary, row=0)
+    async def csn_status(self, interaction, button):
+        with connect() as con:
+            count=con.execute("SELECT COUNT(*) FROM observed_events").fetchone()[0]
+        e=ui_embed("📡 Estado CSN")
+        e.add_field(name="Monitor",value=f"🟢 Cada **{CHECK_MINUTES} min**",inline=True)
+        e.add_field(name="Eventos guardados",value=f"**{count}**",inline=True)
+        await interaction.response.send_message(embed=e,ephemeral=True)
+
+class AlertsPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=900)
+
+    @discord.ui.button(label="Estado", emoji="🔔", style=discord.ButtonStyle.primary, row=0)
+    async def status(self, interaction, button):
+        channel_id=get_setting("alert_channel_id")
+        e=ui_embed("🔔 Alertas")
+        e.add_field(name="Canal",value=(f"<#{channel_id}>" if channel_id else "❌ No configurado"),inline=False)
+        e.add_field(name="Coincidencia 3/3",value="🚨 Notificación prioritaria",inline=True)
+        e.add_field(name="Casi 2/3",value="🟡 Aviso normal",inline=True)
+        await interaction.response.send_message(embed=e,ephemeral=True)
+
+class DiagnosticsPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=900)
+
+    @discord.ui.button(label="Ejecutar diagnóstico", emoji="🩺", style=discord.ButtonStyle.success)
+    async def run_diag(self, interaction, button):
+        checks=[]
+        try:
+            with connect() as con:
+                con.execute("SELECT 1").fetchone()
+            checks.append("✅ SQLite")
+        except Exception as exc:
+            checks.append(f"❌ SQLite: {exc}")
+        checks.append("✅ Discord conectado" if bot.is_ready() else "⚠️ Discord iniciando")
+        checks.append(f"{'✅' if Path(DB_PATH).parent.exists() else '❌'} Ruta de datos: `{Path(DB_PATH).parent}`")
+        try:
+            with connect() as con:
+                n=con.execute("SELECT COUNT(*) FROM observed_events").fetchone()[0]
+            checks.append(f"✅ Eventos CSN en base: **{n}**")
+        except Exception as exc:
+            checks.append(f"❌ Eventos CSN: {exc}")
+        e=ui_embed("🩺 Diagnóstico del sistema","\n".join(checks))
+        await interaction.response.send_message(embed=e,ephemeral=True)
+
+class ImportConfirmView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Sí, importar", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction, button):
+        e=ui_embed(
+            "📥 Importación",
+            "Para conservar exactamente la lógica y validaciones actuales, ejecuta **`/importar_todos`**.\n\n"
+            "El panel no duplica esa rutina: así evitamos que una actualización de interfaz cambie accidentalmente tus datos.",
+            discord.Color.green()
+        )
+        await interaction.response.edit_message(embed=e,view=None)
+
+    @discord.ui.button(label="Cancelar", emoji="❌", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        await interaction.response.edit_message(
+            embed=ui_embed("Importación cancelada","No se modificó ninguna predicción."),
+            view=None
+        )
+
+class MainPanel(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=900)
+
+    @discord.ui.button(label="Predicciones", emoji="🎯", style=discord.ButtonStyle.primary, row=0)
+    async def predictions(self,interaction,button):
+        await interaction.response.send_message(
+            embed=ui_embed("🎯 Centro de predicciones","Resumen, ranking, historial e integridad."),
+            view=PredictionsPanel(),ephemeral=True)
+
+    @discord.ui.button(label="Sismos CSN", emoji="🌎", style=discord.ButtonStyle.primary, row=0)
+    async def csn(self,interaction,button):
+        await interaction.response.send_message(
+            embed=ui_embed("🌎 Centro CSN","Consulta los datos guardados o actualiza el catálogo."),
+            view=CSNPanel(),ephemeral=True)
+
+    @discord.ui.button(label="Importar", emoji="📥", style=discord.ButtonStyle.secondary, row=0)
+    async def importing(self,interaction,button):
+        await interaction.response.send_message(
+            embed=ui_embed("📥 Importar predicciones","¿Quieres abrir la importación del Excel?"),
+            view=ImportConfirmView(),ephemeral=True)
+
+    @discord.ui.button(label="Resultados", emoji="📊", style=discord.ButtonStyle.secondary, row=0)
+    async def results(self,interaction,button):
+        await interaction.response.send_message(embed=build_ranking_embed(),ephemeral=True)
+
+    @discord.ui.button(label="Alertas", emoji="🔔", style=discord.ButtonStyle.secondary, row=0)
+    async def alerts(self,interaction,button):
+        await interaction.response.send_message(
+            embed=ui_embed("🔔 Centro de alertas","Consulta la configuración actual de notificaciones."),
+            view=AlertsPanel(),ephemeral=True)
+
+    @discord.ui.button(label="Calculadora", emoji="🧮", style=discord.ButtonStyle.success, row=1)
+    async def calculator(self,interaction,button):
+        await interaction.response.send_message(
+            embed=ui_embed("🧮 Centro de cálculo","Normal, raíz, distancia, magnitud, tiempo y comparación 3/3."),
+            view=CalculatorView(),ephemeral=True)
+
+    @discord.ui.button(label="Diagnóstico", emoji="🩺", style=discord.ButtonStyle.secondary, row=1)
+    async def diagnostics(self,interaction,button):
+        await interaction.response.send_message(
+            embed=ui_embed("🩺 Diagnóstico","Comprueba rápidamente los componentes principales."),
+            view=DiagnosticsPanel(),ephemeral=True)
+
+    @discord.ui.button(label="Estado", emoji="⚙️", style=discord.ButtonStyle.secondary, row=1)
+    async def status(self,interaction,button):
+        await interaction.response.send_message(embed=build_status_embed(),ephemeral=True)
+
+    @discord.ui.button(label="Historial", emoji="📑", style=discord.ButtonStyle.secondary, row=1)
+    async def history(self,interaction,button):
+        await interaction.response.send_message(embed=build_history_embed(),ephemeral=True)
+
+    @discord.ui.button(label="Ayuda", emoji="❓", style=discord.ButtonStyle.secondary, row=1)
     async def help(self,interaction,button):
         await interaction.response.send_message(embed=build_help_embed(),ephemeral=True)
 
-@bot.tree.command(name="panel",description="Abre el panel visual del Bot Sísmico")
+@bot.tree.command(name="panel",description="Abre el centro de control visual del Bot Sísmico")
 async def c_panel(i:discord.Interaction):
+    ps=get_real_group()
+    with connect() as con:
+        n_events=con.execute("SELECT COUNT(*) FROM observed_events").fetchone()[0]
+        n_corr=con.execute("SELECT COUNT(*) FROM correlation_history").fetchone()[0]
+    channel_id=get_setting("alert_channel_id")
     e=ui_embed(
-        "🌎 Bot Sísmico · Panel principal",
-        "Controla las funciones más usadas sin memorizar comandos.\n\n"
-        "🎯 **Predicciones y CSN** continúan usando el mismo motor y la misma base de datos."
+        "🌎 BOT SÍSMICO · CENTRO DE CONTROL",
+        "Panel principal para revisar el experimento sin memorizar todos los comandos."
     )
-    e.add_field(name="📊 Resultados",value="Estado, ranking e historial",inline=True)
-    e.add_field(name="🧮 Herramientas",value="Calculadora, raíces y comparaciones",inline=True)
-    e.add_field(name="🌐 Datos",value="Actualización manual del CSN",inline=True)
-    e.set_footer(text="Panel v1.2 • Los botones duran 15 minutos")
+    e.add_field(name="🟢 Sistema",value="Online",inline=True)
+    e.add_field(name="🎯 Predicciones",value=f"**{len(ps)}**",inline=True)
+    e.add_field(name="🌎 Sismos CSN",value=f"**{n_events}**",inline=True)
+    e.add_field(name="📑 Correlaciones",value=f"**{n_corr}**",inline=True)
+    e.add_field(name="🔔 Alertas",value=("Configuradas" if channel_id else "Sin canal"),inline=True)
+    e.add_field(name="📡 Monitor",value=f"Cada **{CHECK_MINUTES} min**",inline=True)
+    e.set_footer(text="Panel v1.3 • Los submenús duran 15 minutos")
     await i.response.send_message(embed=e,view=MainPanel())
 
 @bot.tree.command(name="ayuda",description="Muestra una guía limpia de los comandos del bot")
