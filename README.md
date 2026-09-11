@@ -1,41 +1,33 @@
-# Bot Sísmico Discord v0.9 — preparado para hosting 24/7
+# Bot Sísmico Discord v1.0
 
-Mantiene las funciones de v0.8.1:
-- CSN automático
-- histórico
-- grupos reales
-- `/ver_real`
-- alertas automáticas
-- `@everyone`
+Incluye:
+- Alertas automáticas CSN 24/7.
+- 🚨 coincidencia 3/3 con @everyone.
+- 🟡 casi coincidencia cuando cumple exactamente 2/3 filtros (sin @everyone).
+- `/ranking` por IA.
+- `/historial` de correlaciones automáticas.
+- congelado/integridad de predicciones con huella SHA-256.
+- `/integridad` para detectar modificaciones posteriores.
+- backup SQLite diario y `/backup` manual.
+- persistencia Railway usando `DB_PATH=/data/bot_sismico.db`.
 
-## Variables de entorno
-Nunca escribas el token dentro de `bot.py`.
+## Actualización en Railway
+Reemplaza en GitHub los archivos del proyecto por los de v1.0 y haz commit.
+Railway hará el redeploy automáticamente.
 
-Configura en el hosting:
-- `DISCORD_TOKEN` = token secreto del bot
-- `EXCEL_PATH` = `Proyecto_Tabla_de_datos_con_coordenadas.xlsx`
-- `DB_PATH` = `/data/bot_sismico.db` si montas un volumen persistente en `/data`
-- `CSN_CHECK_MINUTES` = `5`
+Mantén estas variables:
+- `DISCORD_TOKEN`
+- `EXCEL_PATH=Proyecto_Tabla_de_datos_con_coordenadas.xlsx`
+- `CSN_CHECK_MINUTES=5`
+- `DB_PATH=/data/bot_sismico.db`
 
-## Persistencia
-SQLite necesita almacenamiento persistente. Si el hosting usa un sistema de archivos
-efímero, monta un volumen en `/data` y configura `DB_PATH=/data/bot_sismico.db`.
-Sin volumen, un redeploy/reinicio podría borrar la base SQLite.
-
-El Excel está incluido en el proyecto. Para cambiarlo en producción, actualiza el archivo
-del proyecto y vuelve a desplegar; luego ejecuta `/importar_todos`.
-
-## Arranque
-El proceso de producción es:
-`python bot.py`
-
-`railway.toml` y `Procfile` ya están incluidos.
-
-## Después del despliegue
-En Discord:
+Después del redeploy:
 1. `/importar_todos`
-2. `/canal_alertas`
+2. `/integridad`
 3. `/estado_alertas`
-4. opcional: `/importar_historico ...`
+4. `/ranking`
 
-Mientras el servicio cloud esté activo, tu PC puede estar apagado.
+## Nota de integridad
+La primera importación de un código crea su huella. Si luego ese mismo código cambia
+en la base, `/integridad` lo marca como MODIFICADA. Esto ayuda a auditar el experimento;
+no convierte las correlaciones en predicciones sísmicas científicamente validadas.

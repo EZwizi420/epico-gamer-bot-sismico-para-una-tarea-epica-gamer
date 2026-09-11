@@ -56,6 +56,24 @@ def init_db():
           sent_at TEXT NOT NULL,
           PRIMARY KEY(event_source_id, prediction_code)
         );
+        CREATE TABLE IF NOT EXISTS prediction_snapshots(
+          code TEXT PRIMARY KEY,
+          group_name TEXT NOT NULL,
+          frozen_at TEXT NOT NULL,
+          fingerprint TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS correlation_history(
+          event_source_id TEXT NOT NULL,
+          prediction_code TEXT NOT NULL,
+          match_level TEXT NOT NULL,
+          detected_at TEXT NOT NULL,
+          event_time TEXT NOT NULL,
+          event_mag REAL NOT NULL,
+          event_place TEXT,
+          distance_km REAL NOT NULL,
+          source_url TEXT,
+          PRIMARY KEY(event_source_id,prediction_code,match_level)
+        );
         CREATE TABLE IF NOT EXISTS observed_events(
           id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_id TEXT NOT NULL,
           occurred_at TEXT NOT NULL, place TEXT, magnitude REAL NOT NULL,
@@ -290,6 +308,7 @@ def import_real_group(group_name):
             except Exception as exc:
                 errors.append(f"fila {row}: {exc}")
 
+    freeze_predictions()
     return imported, skipped, errors
 
 def real_time_ok(event_dt, p):
@@ -362,6 +381,68 @@ def get_real_group(group_name=None):
 
 
 
+
+# ---------- V1.0: INTEGRIDAD, ESTADÍSTICAS E HISTORIAL ----------
+
+def prediction_fingerprint(p):
+    fields = (
+        p["code"], p["group_name"], p["prediction_no"], p["date_start"], p["date_end"],
+        p["daily_time_start"], p["daily_time_end"], p["place"], p["mag_min"], p["mag_max"],
+        p["latitude"], p["longitude"], p["zone_type"], p["geo_note"]
+    )
+    return hashlib.sha256(repr(fields).encode("utf-8")).hexdigest()
+
+def freeze_predictions():
+    """Registra por primera vez cada predicción. No altera la predicción."""
+    now=datetime.now().isoformat()
+    added=0
+    with connect() as con:
+        for p in con.execute("SELECT * FROM real_predictions").fetchall():
+            fp=prediction_fingerprint(p)
+            row=con.execute("SELECT fingerprint FROM prediction_snapshots WHERE code=?",(p["code"],)).fetchone()
+            if row is None:
+                con.execute("""INSERT INTO prediction_snapshots(code,group_name,frozen_at,fingerprint)
+                               VALUES(?,?,?,?)""",(p["code"],p["group_name"],now,fp))
+                added+=1
+    return added
+
+def integrity_status(p):
+    with connect() as con:
+        row=con.execute("SELECT * FROM prediction_snapshots WHERE code=?",(p["code"],)).fetchone()
+    if not row:
+        return "NO_CONGELADA", None
+    return ("OK" if row["fingerprint"]==prediction_fingerprint(p) else "MODIFICADA"), row["frozen_at"]
+
+def save_correlation_history(e,p,level,dist):
+    with connect() as con:
+        con.execute("""INSERT OR IGNORE INTO correlation_history
+          (event_source_id,prediction_code,match_level,detected_at,event_time,event_mag,event_place,distance_km,source_url)
+          VALUES(?,?,?,?,?,?,?,?,?)""",
+          (str(e["source_id"]),p["code"],level,datetime.now().isoformat(),e["occurred_at"],
+           e["magnitude"],e["place"],dist,e["source_url"]))
+
+def backup_database():
+    src=Path(DB_PATH)
+    if not src.exists():
+        return None
+    backup_dir=src.parent/"backups"
+    backup_dir.mkdir(parents=True,exist_ok=True)
+    out=backup_dir/f"bot_sismico_{datetime.now():%Y%m%d_%H%M%S}.db"
+    # SQLite online backup: safe while the bot is running.
+    source=sqlite3.connect(src)
+    target=sqlite3.connect(out)
+    try:
+        source.backup(target)
+    finally:
+        target.close(); source.close()
+    # Keep latest 14 local backups.
+    files=sorted(backup_dir.glob("bot_sismico_*.db"), key=lambda x:x.stat().st_mtime, reverse=True)
+    for old in files[14:]:
+        try: old.unlink()
+        except: pass
+    return out
+
+
 # ---------- ALERTAS AUTOMÁTICAS ----------
 
 def set_setting(key, value):
@@ -423,11 +504,13 @@ async def send_alerts_for_new_events(new_events):
         for p in predictions:
             check=event_matches_real_prediction(e,p)
 
-            # "Parecido" para la alerta = cumple simultáneamente
-            # ventana temporal + rango de magnitud + radio geográfico.
-            if not (check["time"] and check["mag"] and check["geo"]):
+            passed=sum((check["time"],check["mag"],check["geo"]))
+            if passed < 2:
                 continue
-            if alert_was_sent(e["source_id"],p["code"]):
+
+            level="COINCIDENCIA" if passed==3 else "CASI"
+            dedupe_code=p["code"] if level=="COINCIDENCIA" else p["code"]+"#CASI"
+            if alert_was_sent(e["source_id"],dedupe_code):
                 continue
 
             pred_time=""
@@ -435,7 +518,8 @@ async def send_alerts_for_new_events(new_events):
                 pred_time=f"\n🕒 Horario predicho: **{p['daily_time_start']}–{p['daily_time_end']}**"
 
             msg=(
-                "@everyone\n🚨 **CORRELACIÓN SÍSMICA DETECTADA**\n\n"
+                ("@everyone\n🚨 **CORRELACIÓN SÍSMICA DETECTADA**\n\n" if level=="COINCIDENCIA"
+                 else "🟡 **CASI COINCIDENCIA SÍSMICA (2/3 filtros)**\n\n")
                 "🌐 **Sismo observado por el CSN**\n"
                 f"📅 Fecha: **{when:%d/%m/%Y}**\n"
                 f"🕒 Hora local: **{when:%H:%M:%S}**\n"
@@ -467,7 +551,8 @@ async def send_alerts_for_new_events(new_events):
                         replied_user=False
                     )
                 )
-                mark_alert_sent(e["source_id"],p["code"])
+                mark_alert_sent(e["source_id"],dedupe_code)
+                save_correlation_history(e,p,level,check["dist"])
                 sent+=1
             except Exception as exc:
                 print("Error enviando alerta:",exc)
@@ -499,11 +584,22 @@ async def csn_loop():
 @csn_loop.before_loop
 async def before_csn():await bot.wait_until_ready()
 
+
+@tasks.loop(hours=24)
+async def backup_loop():
+    try:
+        out=backup_database()
+        if out: print("Backup SQLite:",out)
+    except Exception as exc:
+        print("Error backup SQLite:",exc)
+
 @bot.event
 async def on_ready():
     await bot.tree.sync()
     if not csn_loop.is_running():csn_loop.start()
-    print(f"Conectado: {bot.user}. CSN cada {CHECK_MINUTES} min.")
+    if not backup_loop.is_running():backup_loop.start()
+    freeze_predictions()
+    print(f"Conectado: {bot.user}. CSN cada {CHECK_MINUTES} min. Backup diario activo.")
 
 @bot.tree.command(name="importar_pruebas",description="Importa PRUEBA desde el Excel")
 async def c_import(i:discord.Interaction):
@@ -834,6 +930,76 @@ async def c_alert_off(i:discord.Interaction):
     with connect() as con:
         con.execute("DELETE FROM bot_settings WHERE key='alert_channel_id'")
     await i.response.send_message("🔕 Alertas automáticas desactivadas.")
+
+
+
+@bot.tree.command(name="ranking",description="Ranking de aciertos cerrados por IA")
+async def c_ranking(i:discord.Interaction):
+    ps=get_real_group()
+    es=events()
+    groups={}
+    for p in ps: groups.setdefault(p["group_name"],[]).append(p)
+    rows=[]
+    for group,gps in groups.items():
+        hits=misses=pending=0
+        for p in gps:
+            st,_,_,_=evaluate_real(p,es)
+            if st=="ACERTADA": hits+=1
+            elif st=="NO ACERTADA": misses+=1
+            else: pending+=1
+        closed=hits+misses
+        pct=(100*hits/closed) if closed else None
+        rows.append((pct if pct is not None else -1,group,hits,closed,pending))
+    rows.sort(reverse=True)
+    lines=["🏆 **RANKING DE PREDICCIONES**"]
+    for pct,g,h,c,pend in rows:
+        score=f"{h}/{c} ({pct:.1f}%)" if c else "sin resultados cerrados"
+        lines.append(f"**{g}** → {score} · 🟡 {pend}")
+    await i.response.send_message("\n".join(lines)[:1950])
+
+@bot.tree.command(name="historial",description="Últimas correlaciones detectadas")
+async def c_history(i:discord.Interaction):
+    with connect() as con:
+        rows=con.execute("""SELECT * FROM correlation_history
+                            ORDER BY detected_at DESC LIMIT 15""").fetchall()
+    if not rows:
+        await i.response.send_message("📭 Todavía no hay correlaciones automáticas guardadas.")
+        return
+    lines=["📑 **HISTORIAL DE CORRELACIONES**"]
+    for r in rows:
+        icon="🚨" if r["match_level"]=="COINCIDENCIA" else "🟡"
+        when=datetime.fromisoformat(r["event_time"])
+        lines.append(f"{icon} **{r['prediction_code']}** ↔ CSN #{r['event_source_id']} · "
+                     f"{when:%d/%m %H:%M} · M{r['event_mag']:.1f} · {r['distance_km']:.1f} km")
+    await i.response.send_message("\n".join(lines)[:1950])
+
+@bot.tree.command(name="integridad",description="Comprueba si las predicciones cambiaron después de registrarse")
+async def c_integrity(i:discord.Interaction):
+    ps=get_real_group()
+    ok=changed=unfrozen=0
+    changed_codes=[]
+    for p in ps:
+        st,frozen=integrity_status(p)
+        if st=="OK": ok+=1
+        elif st=="MODIFICADA":
+            changed+=1; changed_codes.append(p["code"])
+        else: unfrozen+=1
+    msg=(f"🔒 **INTEGRIDAD DE PREDICCIONES**\n"
+         f"✅ Sin cambios: **{ok}**\n⚠️ Modificadas tras registro: **{changed}**\n"
+         f"❔ No congeladas: **{unfrozen}**")
+    if changed_codes: msg+="\n\nModificadas: "+", ".join(changed_codes[:20])
+    await i.response.send_message(msg[:1950])
+
+@bot.tree.command(name="backup",description="Crea ahora una copia de seguridad de SQLite")
+async def c_backup(i:discord.Interaction):
+    try:
+        out=backup_database()
+        await i.response.send_message(
+            f"💾 Backup creado: `{out.name if out else 'sin base de datos'}`\n"
+            "También se crea automáticamente una copia cada 24 horas."
+        )
+    except Exception as exc:
+        await i.response.send_message(f"❌ No pude crear el backup: `{exc}`")
 
 
 init_db()
