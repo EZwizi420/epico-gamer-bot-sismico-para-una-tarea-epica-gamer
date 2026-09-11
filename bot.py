@@ -1004,6 +1004,180 @@ async def c_backup(i:discord.Interaction):
         await i.response.send_message(f"❌ No pude crear el backup: `{exc}`")
 
 
+
+# ---------- V1.1: CALCULADORAS ----------
+
+_ALLOWED_BINOPS = {
+    ast.Add: lambda a,b: a+b,
+    ast.Sub: lambda a,b: a-b,
+    ast.Mult: lambda a,b: a*b,
+    ast.Div: lambda a,b: a/b,
+    ast.FloorDiv: lambda a,b: a//b,
+    ast.Mod: lambda a,b: a%b,
+    ast.Pow: lambda a,b: a**b,
+}
+_ALLOWED_UNARY = {
+    ast.UAdd: lambda a:+a,
+    ast.USub: lambda a:-a,
+}
+
+def safe_calculate(expression):
+    expression=str(expression).strip()
+    if len(expression) > 100:
+        raise ValueError("expresión demasiado larga")
+    tree=ast.parse(expression, mode="eval")
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if isinstance(node, ast.Constant) and type(node.value) in (int,float):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _ALLOWED_BINOPS:
+            a,b=ev(node.left),ev(node.right)
+            # Evitar cálculos gigantes accidentales.
+            if isinstance(node.op, ast.Pow) and abs(b) > 12:
+                raise ValueError("exponente demasiado grande")
+            value=_ALLOWED_BINOPS[type(node.op)](a,b)
+            if abs(value) > 1e15:
+                raise ValueError("resultado demasiado grande")
+            return value
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _ALLOWED_UNARY:
+            return _ALLOWED_UNARY[type(node.op)](ev(node.operand))
+        raise ValueError("solo se permiten números, paréntesis y + - * / // % **")
+
+    return ev(tree)
+
+@bot.tree.command(name="calcular",description="Calculadora normal segura")
+@app_commands.describe(expresion="Ej.: (25*3)+10 o 2**8")
+async def c_calcular(i:discord.Interaction, expresion:str):
+    try:
+        result=safe_calculate(expresion)
+        if isinstance(result,float):
+            shown=f"{result:.10g}"
+        else:
+            shown=str(result)
+        await i.response.send_message(
+            f"🧮 **CALCULADORA**\n`{expresion}`\n= **{shown}**"
+        )
+    except ZeroDivisionError:
+        await i.response.send_message("❌ No se puede dividir por cero.")
+    except Exception as exc:
+        await i.response.send_message(f"❌ Expresión no válida: `{exc}`")
+
+@bot.tree.command(name="distancia",description="Calcula distancia geográfica entre dos coordenadas")
+@app_commands.describe(
+    lat1="Latitud del punto 1", lon1="Longitud del punto 1",
+    lat2="Latitud del punto 2", lon2="Longitud del punto 2"
+)
+async def c_distancia(i:discord.Interaction,lat1:float,lon1:float,lat2:float,lon2:float):
+    if not (-90<=lat1<=90 and -90<=lat2<=90 and -180<=lon1<=180 and -180<=lon2<=180):
+        await i.response.send_message("❌ Coordenadas fuera de rango.")
+        return
+    km=haversine(lat1,lon1,lat2,lon2)
+    await i.response.send_message(
+        "🌎 **DISTANCIA GEOGRÁFICA**\n"
+        f"Punto 1: `{lat1:.5f}, {lon1:.5f}`\n"
+        f"Punto 2: `{lat2:.5f}, {lon2:.5f}`\n"
+        f"📏 Distancia: **{km:.2f} km**\n\n"
+        "Usa la misma fórmula geográfica que el motor del bot."
+    )
+
+@bot.tree.command(name="comparar_magnitud",description="Compara una magnitud observada con una predicción y margen")
+@app_commands.describe(
+    magnitud_predicha="Magnitud central predicha",
+    margen="Margen permitido, ej. 0.3",
+    magnitud_real="Magnitud observada por CSN"
+)
+async def c_comp_mag(i:discord.Interaction,magnitud_predicha:float,margen:float,magnitud_real:float):
+    margen=abs(margen)
+    lo=magnitud_predicha-margen
+    hi=magnitud_predicha+margen
+    diff=abs(magnitud_real-magnitud_predicha)
+    ok=lo<=magnitud_real<=hi
+    await i.response.send_message(
+        "📈 **COMPARACIÓN DE MAGNITUD**\n"
+        f"Predicción: **M{magnitud_predicha:.2f} ±{margen:.2f}**\n"
+        f"Rango: **M{lo:.2f}–M{hi:.2f}**\n"
+        f"CSN: **M{magnitud_real:.2f}**\n"
+        f"Diferencia absoluta: **{diff:.2f}**\n"
+        f"Resultado: {'✅ DENTRO DEL MARGEN' if ok else '❌ FUERA DEL MARGEN'}"
+    )
+
+@bot.tree.command(name="comparar_tiempo",description="Calcula diferencia temporal entre predicción y sismo")
+@app_commands.describe(
+    fecha_predicha="DD/MM/AAAA HH:MM, ej. 11/09/2026 18:30",
+    fecha_real="DD/MM/AAAA HH:MM, ej. 11/09/2026 19:45",
+    margen_horas="Margen permitido en horas"
+)
+async def c_comp_time(i:discord.Interaction,fecha_predicha:str,fecha_real:str,margen_horas:float):
+    try:
+        a=datetime.strptime(fecha_predicha.strip(),"%d/%m/%Y %H:%M")
+        b=datetime.strptime(fecha_real.strip(),"%d/%m/%Y %H:%M")
+    except ValueError:
+        await i.response.send_message("❌ Usa el formato `DD/MM/AAAA HH:MM`.")
+        return
+    delta=abs((b-a).total_seconds())/3600
+    ok=delta<=abs(margen_horas)
+    await i.response.send_message(
+        "🕒 **COMPARACIÓN TEMPORAL**\n"
+        f"Predicción: **{a:%d/%m/%Y %H:%M}**\n"
+        f"Sismo: **{b:%d/%m/%Y %H:%M}**\n"
+        f"Diferencia: **{delta:.2f} h** ({delta*60:.0f} min)\n"
+        f"Margen permitido: **±{abs(margen_horas):.2f} h**\n"
+        f"Resultado: {'✅ DENTRO DEL MARGEN' if ok else '❌ FUERA DEL MARGEN'}"
+    )
+
+@bot.tree.command(name="comparar",description="Calculadora rápida: magnitud + distancia + tiempo")
+@app_commands.describe(
+    magnitud_predicha="Magnitud central predicha",
+    margen_magnitud="Margen ± de magnitud",
+    magnitud_real="Magnitud CSN",
+    distancia_km="Distancia observada en km",
+    radio_km="Radio máximo permitido",
+    diferencia_horas="Diferencia absoluta de tiempo en horas",
+    margen_horas="Margen temporal permitido en horas"
+)
+async def c_comparar(
+    i:discord.Interaction,
+    magnitud_predicha:float,
+    margen_magnitud:float,
+    magnitud_real:float,
+    distancia_km:float,
+    radio_km:float,
+    diferencia_horas:float,
+    margen_horas:float
+):
+    mm=abs(margen_magnitud)
+    mh=abs(margen_horas)
+    lo,hi=magnitud_predicha-mm,magnitud_predicha+mm
+    mag_ok=lo<=magnitud_real<=hi
+    geo_ok=distancia_km<=abs(radio_km)
+    time_ok=abs(diferencia_horas)<=mh
+    passed=sum((mag_ok,geo_ok,time_ok))
+    result="✅ COINCIDENCIA 3/3" if passed==3 else ("🟡 CASI COINCIDENCIA 2/3" if passed==2 else f"❌ NO COINCIDE ({passed}/3)")
+    await i.response.send_message(
+        "🧮 **COMPARACIÓN COMPLETA**\n\n"
+        f"📈 Magnitud: M{magnitud_real:.2f} vs M{lo:.2f}–M{hi:.2f} → {'✅' if mag_ok else '❌'}\n"
+        f"📏 Ubicación: {distancia_km:.2f} km / máximo {abs(radio_km):.2f} km → {'✅' if geo_ok else '❌'}\n"
+        f"🕒 Tiempo: {abs(diferencia_horas):.2f} h / máximo {mh:.2f} h → {'✅' if time_ok else '❌'}\n\n"
+        f"**{result}**"
+    )
+
+@bot.tree.command(name="radio",description="Muestra el radio automático que usaría el motor")
+@app_commands.describe(
+    magnitud="Magnitud central de la predicción",
+    tipo_zona="Ej.: costera, interior, cordillera"
+)
+async def c_radio(i:discord.Interaction,magnitud:float,tipo_zona:str=""):
+    r=radius(magnitud,tipo_zona)
+    await i.response.send_message(
+        "📐 **RADIO AUTOMÁTICO DEL MOTOR**\n"
+        f"Magnitud de referencia: **M{magnitud:.2f}**\n"
+        f"Tipo de zona: **{tipo_zona or 'sin especificar'}**\n"
+        f"Radio calculado: **{r} km**"
+    )
+
+
 init_db()
 if __name__=="__main__":
     if not TOKEN:raise SystemExit("Configura DISCORD_TOKEN.")
