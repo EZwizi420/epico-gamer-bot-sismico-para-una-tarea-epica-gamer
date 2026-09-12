@@ -18,7 +18,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 
 from csn import fetch_recent_events, fetch_recent_events_debug, fetch_historical_events
 from dashboard import run_dashboard
-from evaluator import evaluate_real, best_proximity as shared_evaluate_real
+from evaluator import evaluate_real as shared_evaluate_real, best_proximity
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 EXCEL_PATH = os.getenv("EXCEL_PATH", "Proyecto_Tabla_de_datos_con_coordenadas.xlsx")
