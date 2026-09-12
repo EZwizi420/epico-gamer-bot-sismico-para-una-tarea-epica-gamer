@@ -108,8 +108,12 @@ def proximity_score(prediction, event, default_margin_hours=2):
     # Actual project predictions use date_start/date_end + a daily time window.
     ds=_field(prediction,"date_start")
     de=_field(prediction,"date_end")
-    ts=_field(prediction,"daily_time_start",default="00:00")
-    te=_field(prediction,"daily_time_end",default="23:59:59")
+    ts=_field(prediction,"daily_time_start")
+    te=_field(prediction,"daily_time_end")
+    # Some imported predictions have SQL NULL for daily times.
+    # Treat missing times as the whole day instead of constructing "...TNone".
+    ts = "00:00:00" if ts is None or str(ts).strip() in ("", "None", "nan") else str(ts).strip()
+    te = "23:59:59" if te is None or str(te).strip() in ("", "None", "nan") else str(te).strip()
     if ds and de:
         pstart=parse_datetime(f"{ds}T{ts}")
         pend=parse_datetime(f"{de}T{te}")
