@@ -25,9 +25,15 @@ EXCEL_PATH = os.getenv("EXCEL_PATH", "Proyecto_Tabla_de_datos_con_coordenadas.xl
 DB_PATH = os.getenv("DB_PATH", "bot_sismico.db")
 CHECK_MINUTES = int(os.getenv("CSN_CHECK_MINUTES", "5"))
 DEFAULT_MARGIN_HOURS = 2
+XAI_API_KEY = os.getenv("XAI_API_KEY", "")
+XAI_MODEL = os.getenv("XAI_MODEL", "grok-4-fast")
+XAI_API_URL = os.getenv("XAI_API_URL", "https://api.x.ai/v1/chat/completions")
+
+# OpenAI remains optional as a fallback if you later add credits.
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-5.6")
 AI_API_URL = os.getenv("AI_API_URL", "https://api.openai.com/v1/responses")
+
 AI_MAX_OUTPUT_TOKENS = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "700"))
 AI_HISTORY_TURNS = int(os.getenv("AI_HISTORY_TURNS", "6"))
 
@@ -746,7 +752,7 @@ async def c_state(i:discord.Interaction):
     await i.response.send_message(f"🌐 Eventos CSN guardados: **{row['n']}**\nÚltimo: **{row['last'] or 'ninguno'}**")
 
 
-@bot.tree.command(name="csn_diagnostico",description="Compara el catálogo CSN fresco con SQLite y detecta retrasos")
+@bot.tree.command(name="csn_diagnostico",description="Diagnostica catálogos CSN Chile/UTC y SQLite")
 async def c_csn_diag(i:discord.Interaction):
     await i.response.defer(thinking=True, ephemeral=True)
     try:
@@ -758,34 +764,34 @@ async def c_csn_diag(i:discord.Interaction):
         db_events=events()
         newest_web=d["newest"]
         newest_db=db_events[0] if db_events else None
-
-        # "Synced" requires IDs to match AND newest timestamps to match.
         same_latest=False
         if newest_web and newest_db:
             same_latest=(parse_datetime(newest_web["occurred_at"]) == parse_datetime(newest_db["occurred_at"]))
         elif newest_web is None and newest_db is None:
             same_latest=True
-
         state="🟢 Sincronizado" if not missing and same_latest else "🔴 DESACTUALIZADO"
-        age=d["newest_age_minutes"]
-        age_txt="—" if age is None else f"{age:.0f} min"
 
         def fmt(e):
             if not e: return "—"
             dt=parse_datetime(e["occurred_at"])
             return f"{dt:%d/%m/%Y %H:%M:%S} · M{e['magnitude']:.1f}\n{e['place']}"
 
-        embed=discord.Embed(title="🛰️ Diagnóstico CSN fresco",color=(discord.Color.green() if state.startswith("🟢") else discord.Color.red()))
-        embed.add_field(name="Hoy",value=str(d["today_count"]),inline=True)
-        embed.add_field(name="Ayer",value=str(d["yesterday_count"]),inline=True)
+        cat="\n".join(
+            f"`{day}` → **{d['counts'].get(day,0)}**"
+            for day in sorted(d["counts"])
+        )
+        embed=discord.Embed(title="🛰️ Diagnóstico CSN multi-día",color=(discord.Color.green() if state.startswith("🟢") else discord.Color.red()))
+        embed.add_field(name="📆 Catálogos consultados",value=cat or "—",inline=False)
+        embed.add_field(name="Eventos únicos",value=str(d["total_count"]),inline=True)
         embed.add_field(name="Faltantes SQLite",value=str(len(missing)),inline=True)
         embed.add_field(name="Estado",value=state,inline=True)
-        embed.add_field(name="Edad último CSN",value=age_txt,inline=True)
-        embed.add_field(name="🌐 Último CSN",value=fmt(newest_web),inline=False)
+        embed.add_field(name="🌐 Último CSN leído",value=fmt(newest_web),inline=False)
         embed.add_field(name="💾 Último guardado",value=fmt(newest_db),inline=False)
         if missing:
-            sample="\n".join(f"• {parse_datetime(e['occurred_at']):%H:%M:%S} M{e['magnitude']:.1f} {e['place']}" for e in missing[:8])
-            embed.add_field(name="Eventos faltantes",value=sample[:1000],inline=False)
+            sample="\n".join(f"• {parse_datetime(e['occurred_at']):%d/%m %H:%M:%S} M{e['magnitude']:.1f} {e['place']}" for e in missing[:8])
+            embed.add_field(name="⚠️ Faltantes",value=sample[:1000],inline=False)
+        if d["errors"]:
+            embed.add_field(name="Errores de consulta",value="\n".join(d["errors"][:6])[:1000],inline=False)
         await i.followup.send(embed=embed,ephemeral=True)
     except Exception as exc:
         await i.followup.send(f"❌ Diagnóstico falló: `{type(exc).__name__}: {str(exc)[:900]}`",ephemeral=True)
@@ -1542,42 +1548,108 @@ def ai_system_prompt():
         "Responde en español salvo que el usuario pida otro idioma. Sé claro y relativamente breve."
     )
 
-def call_ai_sync(user_id, question):
-    if not AI_API_KEY:
-        raise RuntimeError("AI_API_KEY no está configurada en Railway")
-    history=list(_ai_history[str(user_id)])
-    input_items=[{"role":"system","content":[{"type":"input_text","text":ai_system_prompt()+"\n\n"+ai_project_snapshot()}]}]
-    for role,text in history:
-        input_items.append({"role":role,"content":[{"type":"input_text","text":text}]})
-    input_items.append({"role":"user","content":[{"type":"input_text","text":question}]})
-    payload={
-        "model":AI_MODEL,
-        "input":input_items,
-        "max_output_tokens":AI_MAX_OUTPUT_TOKENS
+def _call_grok(messages):
+    if not XAI_API_KEY:
+        raise RuntimeError("XAI_API_KEY no está configurada")
+    payload = {
+        "model": XAI_MODEL,
+        "messages": messages,
+        "max_tokens": AI_MAX_OUTPUT_TOKENS,
+        "temperature": 0.7,
     }
-    r=requests.post(
-        AI_API_URL,
-        headers={"Authorization":f"Bearer {AI_API_KEY}","Content-Type":"application/json"},
+    r = requests.post(
+        XAI_API_URL,
+        headers={
+            "Authorization": f"Bearer {XAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
         json=payload,
-        timeout=75
+        timeout=75,
     )
     if not r.ok:
-        detail=r.text[:500]
-        raise RuntimeError(f"API IA {r.status_code}: {detail}")
-    data=r.json()
-    answer=data.get("output_text")
+        try:
+            detail = r.json()
+            msg = detail.get("error", {}).get("message") or str(detail)
+        except Exception:
+            msg = r.text[:500]
+        raise RuntimeError(f"Grok/xAI {r.status_code}: {msg[:500]}")
+    data = r.json()
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        raise RuntimeError("Grok/xAI no devolvió texto")
+
+def _call_openai_fallback(user_id, question, history):
+    if not XAI_API_KEY and not AI_API_KEY:
+        raise RuntimeError("OpenAI fallback no configurado")
+    input_items = [{
+        "role": "system",
+        "content": [{"type": "input_text", "text": ai_system_prompt()+"\n\n"+ai_project_snapshot()}],
+    }]
+    for role, text in history:
+        input_items.append({"role": role, "content": [{"type": "input_text", "text": text}]})
+    input_items.append({"role": "user", "content": [{"type": "input_text", "text": question}]})
+    payload = {
+        "model": AI_MODEL,
+        "input": input_items,
+        "max_output_tokens": AI_MAX_OUTPUT_TOKENS,
+    }
+    r = requests.post(
+        AI_API_URL,
+        headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=75,
+    )
+    if not r.ok:
+        raise RuntimeError(f"OpenAI {r.status_code}: {r.text[:350]}")
+    data = r.json()
+    answer = data.get("output_text")
     if not answer:
-        parts=[]
-        for item in data.get("output",[]):
-            if item.get("type")=="message":
-                for c in item.get("content",[]):
-                    if c.get("type")=="output_text" and c.get("text"):
+        parts = []
+        for item in data.get("output", []):
+            if item.get("type") == "message":
+                for c in item.get("content", []):
+                    if c.get("type") == "output_text" and c.get("text"):
                         parts.append(c["text"])
-        answer="\n".join(parts).strip()
+        answer = "\n".join(parts).strip()
     if not answer:
-        raise RuntimeError("La API no devolvió texto")
-    _ai_history[str(user_id)].append(("user",question))
-    _ai_history[str(user_id)].append(("assistant",answer))
+        raise RuntimeError("OpenAI no devolvió texto")
+    return answer
+
+def call_ai_sync(user_id, question):
+    if not XAI_API_KEY and not AI_API_KEY:
+        raise RuntimeError("Configura XAI_API_KEY en Railway para activar /chat")
+
+    history = list(_ai_history[str(user_id)])
+    system = ai_system_prompt() + "\n\n" + ai_project_snapshot()
+    messages = [{"role": "system", "content": system}]
+    for role, text in history:
+        messages.append({"role": role, "content": text})
+    messages.append({"role": "user", "content": question})
+
+    grok_error = None
+    answer = None
+
+    if XAI_API_KEY:
+        try:
+            answer = _call_grok(messages)
+        except Exception as exc:
+            grok_error = exc
+
+    # Optional fallback only when an OpenAI key is present.
+    if not answer and AI_API_KEY:
+        try:
+            answer = _call_openai_fallback(user_id, question, history)
+        except Exception as openai_exc:
+            if grok_error:
+                raise RuntimeError(f"{grok_error} | Fallback: {openai_exc}")
+            raise
+
+    if not answer:
+        raise grok_error or RuntimeError("No hay proveedor de IA disponible")
+
+    _ai_history[str(user_id)].append(("user", question))
+    _ai_history[str(user_id)].append(("assistant", answer))
     return answer
 
 async def send_ai_answer(interaction, question):
@@ -1601,9 +1673,9 @@ async def send_ai_answer(interaction, question):
             await interaction.followup.send(chunk)
     except Exception as exc:
         await interaction.followup.send(
-            "❌ No pude usar el chat de IA.\n"
+            "❌ **Chat IA no disponible**\n"
             f"`{str(exc)[:700]}`\n\n"
-            "Comprueba `AI_API_KEY`, `AI_MODEL` y que Railway tenga acceso a Internet.",
+            "Para Grok comprueba `XAI_API_KEY` y `XAI_MODEL` en Railway.",
             ephemeral=True
         )
 
@@ -2070,7 +2142,7 @@ class MainPanel(discord.ui.View):
     async def ai_chat(self,interaction,button):
         if not AI_API_KEY:
             await interaction.response.send_message(
-                "⚠️ El chat IA todavía no tiene una clave configurada. Añade `AI_API_KEY` en Railway.",
+                "⚠️ El chat IA no tiene una clave configurada. Añade `XAI_API_KEY` en Railway para usar Grok.",
                 ephemeral=True
             )
             return
