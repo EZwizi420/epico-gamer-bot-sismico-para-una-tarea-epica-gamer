@@ -171,3 +171,101 @@ ranking, resultados y eventos guardados, pero también puede conversar de temas 
 ## v1.5.3.1 — Dependencies Fix
 Corrige el crash de Railway `ModuleNotFoundError: No module named 'reportlab'`.
 `requirements.txt` incluye ReportLab y las dependencias principales usadas por el proyecto.
+
+## v1.5.4 — CSN Fresh Sync Fix
+- El lector diario usa la tabla oficial del catálogo CSN como fuente primaria.
+- Añade headers no-cache y query única para reducir respuestas web antiguas.
+- IDs estables basados en hora/coordenadas para evitar duplicados.
+- `/actualizar_csn` fuerza lectura fresca y publica nuevos eventos en el feed.
+- `/csn_diagnostico` ya no considera sincronizado solo porque el parser y SQLite coincidan:
+  también compara el último timestamp real leído contra el último guardado.
+
+## v1.5.4.1 — CSN Compatibility Fix
+Corrige el crash por `fetch_historical_events` faltante y restaura la interfaz que espera bot.py:
+`fetch_recent_events()` vuelve a devolver `(eventos, errores)`. También mantiene compatibilidad
+con `/importar_historico`, `save_csn_event()` y el feed de todos los sismos.
+
+## v1.5.5 — CSN Multi-Day Chile/UTC
+El monitor ya no decide un único "hoy". Consulta un margen de catálogos alrededor de
+las fechas actuales de Chile y UTC (incluyendo 12/09 cuando UTC ya cruzó de día),
+fusiona los eventos por ID y elige el timestamp más reciente.
+`/csn_diagnostico` muestra exactamente cuántos eventos obtuvo de cada fecha consultada.
+
+
+## v1.5.6 — Grok/xAI para /chat
+
+`/chat` usa Grok mediante la API de xAI como proveedor principal.
+
+Variables de Railway:
+- `XAI_API_KEY` — clave de xAI.
+- `XAI_MODEL` — por defecto `grok-4-fast`.
+- `XAI_API_URL` — opcional, por defecto `https://api.x.ai/v1/chat/completions`.
+
+Si `AI_API_KEY` sigue configurada, OpenAI queda como fallback opcional. Si no quieres
+que se intente OpenAI, elimina `AI_API_KEY` de Railway.
+
+La API key debe guardarse únicamente como variable secreta de Railway, nunca en GitHub.
+
+
+## v1.5.7 — Sin IA
+Se eliminó por completo el chat de IA:
+- sin `/chat`
+- sin `/chat_nuevo`
+- sin botón `Chat IA`
+- sin claves OpenAI/xAI
+- sin llamadas a APIs de modelos
+
+Se conservan las funciones sísmicas, CSN multi-día Chile/UTC, feed de sismos,
+alertas de predicciones, dashboard, PDF, calculadora e importación/evaluación.
+
+
+## v1.6 — Score de proximidad
+Se conserva el resultado oficial estricto 3/3 (tiempo + magnitud + ubicación).
+Se añade `/score codigo:GROK_03` con un índice descriptivo 0–100:
+- Ubicación: 40%
+- Magnitud: 30%
+- Tiempo: 30%
+
+El score NO convierte un fallo en acierto. Sirve para ordenar y medir qué tan cerca estuvo
+una predicción. Para evitar resultados engañosos, el informe muestra también cada componente,
+la distancia real y el sismo utilizado. El score no demuestra capacidad predictiva ni
+significancia estadística por sí solo.
+
+
+## v1.6.1 — Estado del sistema
+Nuevo comando `/estado_sistema`:
+- uptime del proceso
+- RAM máxima usada
+- carga CPU 1/5/15 min
+- tamaño de SQLite
+- número de predicciones
+- número de sismos guardados
+- último sismo guardado
+- comprobación básica de SQLite/monitor
+
+No añade dependencias nuevas y no hace consultas extra al CSN al abrir el panel.
+
+## v1.6.2 — Estado sistema time-name fix
+Corrige el crash `AttributeError: type object 'datetime.time' has no attribute 'time'`.
+El uptime usa ahora `time.monotonic()` importado como `pytime`, evitando la colisión
+con `datetime.time`.
+
+## v1.6.3 — Score distance fix
+Corrige `/score`: `proximity_score()` llamaba por error a `haversine_km`, pero
+el evaluador existente define `haversine`. Se añadió una prueba funcional del score
+además de la compilación.
+
+## v1.6.5 — Score temporal NULL fix
+Corrige `/score` cuando `daily_time_start` o `daily_time_end` vienen NULL desde SQLite.
+En ese caso el score interpreta la predicción como día completo (00:00:00–23:59:59),
+evitando valores inválidos como `2026-09-11TNone`.
+
+## v1.6.6 — Score contract + fail-safe
+Corrige el contrato real de `evaluate_real()`: devuelve 2 valores, no 4.
+`/score` ahora hace defer inmediato y captura excepciones para que Discord muestre
+un error útil en vez de `La aplicación no respondió`.
+
+## v1.6.7 — Score import fix
+Corrige `NameError: best_proximity is not defined`: `bot.py` ahora importa
+explícitamente `best_proximity` desde evaluator.py. Se verifica además que la función
+exista antes de empaquetar.
