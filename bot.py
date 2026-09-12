@@ -1994,7 +1994,7 @@ async def c_score(i:discord.Interaction,codigo:str):
             return
         p=ps[0]
         es=events()
-        status, matched = evaluate_real(p,es)
+        status, matched, strict_radius, candidates = evaluate_real(p,es)
         candidate, sc=best_proximity(p,es,DEFAULT_MARGIN_HOURS)
         if not sc:
             await i.followup.send("No hay sismos guardados para calcular el score.",ephemeral=True)
@@ -2003,7 +2003,7 @@ async def c_score(i:discord.Interaction,codigo:str):
         e=candidate
         dt=parse_datetime(e["occurred_at"])
         emb=discord.Embed(title=f"🎯 Score · {p['code']}",description=f"**{sc['score']:.1f}%** de proximidad\nResultado oficial: **{strict}**",color=discord.Color.blurple())
-        emb.add_field(name="📍 Ubicación · 40%",value=f"**{sc['spatial_pct']:.1f}%**\nDistancia: {sc['distance_km']:.2f} km / radio {float(p['radius'] if 'radius' in p.keys() else p['radius_km']):.1f} km",inline=True)
+        emb.add_field(name="📍 Ubicación · 40%",value=f"**{sc['spatial_pct']:.1f}%**\nDistancia: {sc['distance_km']:.2f} km / radio estricto {strict_radius:.1f} km",inline=True)
         emb.add_field(name="📈 Magnitud · 30%",value=f"**{sc['magnitude_pct']:.1f}%**\nReal: M{float(e['magnitude']):.1f} · Pred.: {float(p['mag_min']):.1f}–{float(p['mag_max']):.1f}",inline=True)
         emb.add_field(name="⏱️ Tiempo · 30%",value=f"**{sc['temporal_pct']:.1f}%**\nEvento: {dt:%d/%m/%Y %H:%M:%S}",inline=True)
         emb.add_field(name="🌎 Sismo más próximo al criterio",value=e["place"],inline=False)

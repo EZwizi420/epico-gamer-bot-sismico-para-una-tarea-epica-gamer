@@ -92,13 +92,13 @@ def proximity_score(prediction, event, default_margin_hours=2):
     elon=float(_field(event,"lon","longitude"))
     distance=haversine(plat,plon,elat,elon)
 
-    # Existing project schema uses radius; newer rows may use radius_km.
-    radius=max(float(_field(prediction,"radius","radius_km",default=75.0)),1e-9)
-    spatial=_clamp01(1.0-distance/(2.0*radius))
-
     mag=float(_field(event,"mag","magnitude"))
     mmin=float(_field(prediction,"mag_min","magnitude_min"))
     mmax=float(_field(prediction,"mag_max","magnitude_max"))
+
+    # Use the exact same radius rule as the official strict evaluator.
+    strict_radius=max(float(radius((mmin+mmax)/2, _field(prediction,"zone_type"))),1e-9)
+    spatial=_clamp01(1.0-distance/(2.0*strict_radius))
     mag_width=max(mmax-mmin,0.1)
     magnitude=_range_closeness(mag,mmin,mmax,mag_width)
 
@@ -140,7 +140,7 @@ def proximity_score(prediction, event, default_margin_hours=2):
         "magnitude_pct": round(magnitude*100,1),
         "temporal_pct": round(temporal*100,1),
         "distance_km": round(distance,2),
-        "radius_km": round(radius,2),
+        "radius_km": round(strict_radius,2),
         "time_error_hours": round(time_error_h,2),
     }
 
