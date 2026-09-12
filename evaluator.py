@@ -52,3 +52,68 @@ def evaluate_real(p,es,now=None):
     matches.sort(key=lambda x:(x["dist"],abs(x["e"]["magnitude"]-center)))
     status="ACERTADA" if matches else ("NO ACERTADA" if real_window_finished(p,now) else "PENDIENTE")
     return status,(matches[0] if matches else None),rad,candidates
+
+
+# ---------- v1.6: SCORE DE PROXIMIDAD ----------
+# IMPORTANT: this score is descriptive. It never changes the strict 3/3 result.
+
+def _clamp01(x):
+    return max(0.0, min(1.0, float(x)))
+
+def _range_closeness(value, low, high, tolerance):
+    """100% inside range; decays linearly outside until tolerance is exhausted."""
+    if value is None:
+        return 0.0
+    low=float(low); high=float(high); value=float(value)
+    if low <= value <= high:
+        return 1.0
+    error = low-value if value < low else value-high
+    tol=max(float(tolerance or 0), 1e-9)
+    return _clamp01(1.0-error/tol)
+
+def proximity_score(prediction, event, default_margin_hours=2):
+    """
+    Score 0-100:
+      40% spatial + 30% magnitude + 30% temporal.
+    Strict pass/fail remains evaluate_real()/evaluate_prediction().
+    """
+    # Reuse project helpers/field conventions.
+    plat=float(prediction["latitude"]); plon=float(prediction["longitude"])
+    elat=float(event["latitude"]); elon=float(event["longitude"])
+    distance=haversine_km(plat,plon,elat,elon)
+    radius=max(float(prediction["radius_km"]),1e-9)
+    # 100% at same point, 50% at strict radius, fades to 0 at 2x radius.
+    spatial=_clamp01(1.0-distance/(2.0*radius))
+
+    mag=float(event["magnitude"])
+    mmin=float(prediction["mag_min"]); mmax=float(prediction["mag_max"])
+    mag_width=max(mmax-mmin,0.1)
+    magnitude=_range_closeness(mag,mmin,mmax,mag_width)
+
+    edt=parse_datetime(event["occurred_at"])
+    pstart=parse_datetime(prediction["start_at"])
+    pend=parse_datetime(prediction["end_at"])
+    margin_h=float(prediction.get("margin_hours") or default_margin_hours)
+    if pstart <= edt <= pend:
+        temporal=1.0
+        time_error_h=0.0
+    else:
+        time_error_h=(pstart-edt).total_seconds()/3600 if edt<pstart else (edt-pend).total_seconds()/3600
+        temporal=_clamp01(1.0-time_error_h/max(margin_h,1e-9))
+
+    total=100.0*(0.40*spatial+0.30*magnitude+0.30*temporal)
+    return {
+        "score": round(total,1),
+        "spatial_pct": round(spatial*100,1),
+        "magnitude_pct": round(magnitude*100,1),
+        "temporal_pct": round(temporal*100,1),
+        "distance_km": round(distance,2),
+        "time_error_hours": round(time_error_h,2),
+    }
+
+def best_proximity(prediction, event_list, default_margin_hours=2):
+    if not event_list:
+        return None, None
+    ranked=[(proximity_score(prediction,e,default_margin_hours),e) for e in event_list]
+    ranked.sort(key=lambda x:x[0]["score"],reverse=True)
+    return ranked[0][1], ranked[0][0]
