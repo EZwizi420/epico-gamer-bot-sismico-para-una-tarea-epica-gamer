@@ -1,5 +1,6 @@
 import re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urljoin
 
 import requests
@@ -121,9 +122,15 @@ def fetch_historical_events(start_day, end_day):
         day += timedelta(days=1)
     return events, errors
 
-def fetch_recent_events(limit=30):
-    """Para tiempo real lee el catálogo de hoy y, por seguridad, el de ayer."""
-    today = datetime.now().date()
-    events, errors = fetch_historical_events(today - timedelta(days=1), today)
+def fetch_recent_events(limit=None):
+    """Lee completos los catálogos de hoy y ayer usando la fecha local de Chile.
+
+    `limit=None` evita perder sismos cuando hay más de 30 eventos entre consultas.
+    Se conserva el parámetro para compatibilidad con versiones anteriores.
+    """
+    chile_today = datetime.now(ZoneInfo("America/Santiago")).date()
+    events, errors = fetch_historical_events(chile_today - timedelta(days=1), chile_today)
     events.sort(key=lambda e: e["occurred_at"], reverse=True)
+    if limit is None:
+        return events, errors
     return events[:limit], errors

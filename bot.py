@@ -1,5 +1,5 @@
 import ast
-import os, re, math, sqlite3, hashlib
+import os, re, math, sqlite3, hashlib, threading
 from datetime import datetime, date, time, timedelta
 from pathlib import Path
 
@@ -9,6 +9,7 @@ from discord.ext import commands, tasks
 from openpyxl import load_workbook
 
 from csn import fetch_recent_events, fetch_historical_events
+from dashboard import run_dashboard
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 EXCEL_PATH = os.getenv("EXCEL_PATH", "Proyecto_Tabla_de_datos_con_coordenadas.xlsx")
@@ -1700,4 +1701,6 @@ async def c_raiz(i:discord.Interaction,numero:float,indice:float=2.0):
 init_db()
 if __name__=="__main__":
     if not TOKEN:raise SystemExit("Configura DISCORD_TOKEN.")
+    threading.Thread(target=run_dashboard, daemon=True, name="sismologia-lab-web").start()
+    print("Sismologia Lab web iniciado en PORT", os.getenv("PORT","8080"))
     bot.run(TOKEN)
