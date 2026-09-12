@@ -1,5 +1,5 @@
 import ast
-import os, re, math, sqlite3, hashlib, threading, tempfile
+import os, re, math, sqlite3, hashlib, threading, tempfile, resource, time
 from datetime import datetime, date, time, timedelta
 from pathlib import Path
 
@@ -17,13 +17,14 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 
 from csn import fetch_recent_events, fetch_recent_events_debug, fetch_historical_events
 from dashboard import run_dashboard
-from evaluator import evaluate_real as shared_evaluate_real
+from evaluator import evaluate_real, best_proximity as shared_evaluate_real
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 EXCEL_PATH = os.getenv("EXCEL_PATH", "Proyecto_Tabla_de_datos_con_coordenadas.xlsx")
 DB_PATH = os.getenv("DB_PATH", "bot_sismico.db")
 CHECK_MINUTES = int(os.getenv("CSN_CHECK_MINUTES", "5"))
 DEFAULT_MARGIN_HOURS = 2
+BOT_STARTED_AT = time.time()
 
 def parse_datetime(value):
     if isinstance(value, datetime):
@@ -1980,4 +1981,136 @@ if __name__=="__main__":
     if not TOKEN:raise SystemExit("Configura DISCORD_TOKEN.")
     threading.Thread(target=run_dashboard, daemon=True, name="sismologia-lab-web").start()
     print("Sismologia Lab web iniciado en PORT", os.getenv("PORT","8080"))
-    bot.run(TOKEN)
+    
+@bot.tree.command(name="score",description="Muestra el porcentaje de proximidad de una predicción al mejor sismo")
+@app_commands.describe(codigo="Código de predicción, por ejemplo GROK_03")
+async def c_score(i:discord.Interaction,codigo:str):
+    ps=[p for p in get_real_group() if str(p["code"]).upper()==codigo.upper()]
+    if not ps:
+        await i.response.send_message(f"❌ No encontré `{codigo}`.",ephemeral=True)
+        return
+    p=ps[0]
+    es=events()
+    status, matched, _, _ = evaluate_real(p,es)
+    candidate, sc=best_proximity(p,es,DEFAULT_MARGIN_HOURS)
+    if not sc:
+        await i.response.send_message("No hay sismos guardados para calcular el score.",ephemeral=True)
+        return
+    strict="✅ ACERTADA" if status=="ACERTADA" else ("❌ NO ACERTADA" if status=="NO ACERTADA" else "🟡 PENDIENTE")
+    e=candidate
+    dt=parse_datetime(e["occurred_at"])
+    emb=discord.Embed(title=f"🎯 Score · {p['code']}",description=f"**{sc['score']:.1f}%** de proximidad\nResultado oficial: **{strict}**",color=discord.Color.blurple())
+    emb.add_field(name="📍 Ubicación · 40%",value=f"**{sc['spatial_pct']:.1f}%**\nDistancia: {sc['distance_km']:.2f} km / radio {float(p['radius_km']):.1f} km",inline=True)
+    emb.add_field(name="📈 Magnitud · 30%",value=f"**{sc['magnitude_pct']:.1f}%**\nReal: M{float(e['magnitude']):.1f} · Pred.: {float(p['mag_min']):.1f}–{float(p['mag_max']):.1f}",inline=True)
+    emb.add_field(name="⏱️ Tiempo · 30%",value=f"**{sc['temporal_pct']:.1f}%**\nEvento: {dt:%d/%m/%Y %H:%M:%S}",inline=True)
+    emb.add_field(name="🌎 Sismo más próximo al criterio",value=e["place"],inline=False)
+    emb.set_footer(text="Score descriptivo; no modifica el criterio oficial 3/3.")
+    await i.response.send_message(embed=emb)
+
+
+# ---------- v1.6.1: ESTADO DEL SISTEMA ----------
+
+def _human_bytes(n):
+    n=float(n or 0)
+    for unit in ("B","KB","MB","GB","TB"):
+        if n < 1024 or unit=="TB":
+            return f"{n:.1f} {unit}"
+        n /= 1024
+
+def _uptime_text():
+    sec=max(0,int(time.time()-BOT_STARTED_AT))
+    days,sec=divmod(sec,86400)
+    hours,sec=divmod(sec,3600)
+    mins,_=divmod(sec,60)
+    if days: return f"{days}d {hours}h {mins}m"
+    if hours: return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+def _system_snapshot():
+    # ru_maxrss is KB on Linux (Railway).
+    rss_kb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    ram_bytes=rss_kb*1024
+
+    db_size=0
+    try:
+        db_size=os.path.getsize(DB_PATH)
+    except Exception:
+        pass
+
+    try:
+        ps_count=len(get_real_group())
+    except Exception:
+        ps_count=0
+    try:
+        ev_count=len(events())
+    except Exception:
+        ev_count=0
+
+    # Load average is more reliable/cheap than inventing a CPU percentage without psutil.
+    try:
+        load1,load5,load15=os.getloadavg()
+        cpu_txt=f"Load: {load1:.2f} / {load5:.2f} / {load15:.2f}"
+    except Exception:
+        cpu_txt="No disponible"
+
+    # Basic CSN freshness check from the DB, without making an extra web request.
+    newest=None
+    try:
+        evs=events()
+        newest=evs[0] if evs else None
+    except Exception:
+        newest=None
+
+    latest_txt="Sin eventos"
+    monitor_state="🟡 Sin datos"
+    if newest:
+        try:
+            dt=parse_datetime(newest["occurred_at"])
+            latest_txt=f"{dt:%d/%m/%Y %H:%M:%S} · M{float(newest['magnitude']):.1f}"
+            monitor_state="🟢 Con datos"
+        except Exception:
+            latest_txt=str(newest.get("occurred_at","—"))
+
+    return {
+        "ram": _human_bytes(ram_bytes),
+        "db": _human_bytes(db_size),
+        "predictions": ps_count,
+        "events": ev_count,
+        "cpu": cpu_txt,
+        "uptime": _uptime_text(),
+        "latest": latest_txt,
+        "monitor": monitor_state,
+    }
+
+@bot.tree.command(name="estado_sistema",description="Muestra salud, RAM, base de datos y estado general del bot")
+async def c_system_status(i:discord.Interaction):
+    snap=_system_snapshot()
+
+    # Conservative health label: process alive + DB accessible is enough for green;
+    # CSN freshness remains separately visible instead of claiming web sync.
+    general="🟢 SALUDABLE"
+    try:
+        with connect() as con:
+            con.execute("SELECT 1").fetchone()
+    except Exception:
+        general="🔴 PROBLEMA CON SQLITE"
+
+    embed=discord.Embed(
+        title="🖥️ Estado del sistema",
+        description=f"Estado general: **{general}**",
+        color=discord.Color.green() if general.startswith("🟢") else discord.Color.red()
+    )
+    embed.add_field(name="⏱️ Uptime",value=snap["uptime"],inline=True)
+    embed.add_field(name="🧠 RAM máx.",value=snap["ram"],inline=True)
+    embed.add_field(name="⚙️ CPU",value=snap["cpu"],inline=True)
+    embed.add_field(name="💾 SQLite",value=snap["db"],inline=True)
+    embed.add_field(name="🎯 Predicciones",value=str(snap["predictions"]),inline=True)
+    embed.add_field(name="🌎 Sismos guardados",value=str(snap["events"]),inline=True)
+    embed.add_field(name="📡 Monitor CSN",value=snap["monitor"],inline=True)
+    embed.add_field(name="🌐 Dashboard",value="🟢 Proceso integrado" if 'dashboard' else "—",inline=True)
+    embed.add_field(name="🕒 Último sismo guardado",value=snap["latest"],inline=False)
+    embed.set_footer(text="CPU se muestra como carga del sistema (1/5/15 min), no como porcentaje.")
+    await i.response.send_message(embed=embed,ephemeral=True)
+
+
+bot.run(TOKEN)
