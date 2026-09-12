@@ -539,8 +539,9 @@ async def send_csn_feed_for_new_events(new_events):
             value=(f"{e['depth_km']:.1f} km" if e["depth_km"] is not None else "Sin dato"),
             inline=True
         )
-        if e["source_url"]:
-            embed.add_field(name="🔗 Informe oficial",value=f"[Abrir en CSN]({e['source_url']})",inline=False)
+        event_url = e.get("source_url") or e.get("url")
+        if event_url:
+            embed.add_field(name="🔗 Informe oficial",value=f"[Abrir en CSN]({event_url})",inline=False)
         embed.set_footer(text=f"CSN ID: {e['source_id']} · Feed automático, sin @everyone")
         try:
             await channel.send(
@@ -682,10 +683,10 @@ async def c_import(i:discord.Interaction):
 async def c_update_csn(i:discord.Interaction):
     await i.response.defer(thinking=True, ephemeral=True)
     try:
-        fetched=fetch_recent_events(limit=None)
+        fetched, errs = fetch_recent_events(limit=None)
         newly_saved=[]
         for e in fetched:
-            if save_event(e):
+            if save_csn_event(e):
                 newly_saved.append(e)
         feed_sent=await send_csn_feed_for_new_events(newly_saved) if newly_saved else 0
         alerts_sent=await send_alerts_for_new_events(newly_saved) if newly_saved else 0
@@ -700,7 +701,8 @@ async def c_update_csn(i:discord.Interaction):
             f"Nuevos guardados: **{len(newly_saved)}**\n"
             f"Publicados en #sismos: **{feed_sent}**\n"
             f"Alertas de predicción: **{alerts_sent}**\n"
-            f"Último evento leído: **{newest_txt}**",
+            f"Último evento leído: **{newest_txt}**" +
+            (f"\n⚠️ Avisos CSN: **{len(errs)}** · `{errs[0][:250]}`" if errs else ""),
             ephemeral=True
         )
     except Exception as exc:

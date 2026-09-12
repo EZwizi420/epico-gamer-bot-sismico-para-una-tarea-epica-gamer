@@ -83,42 +83,69 @@ def fetch_day(day):
 
         events.append({
             "source_id": source_id,
-            "occurred_at": occurred.isoformat(),
+            "occurred_at": occurred,
             "place": place or "Sin referencia",
             "latitude": lat,
             "longitude": lon,
             "depth_km": depth,
             "magnitude": mag,
             "source_url": source_url,
+            "url": source_url,
         })
 
     # Newest first and unique by source_id.
     unique = {e["source_id"]: e for e in events}
     return sorted(unique.values(), key=lambda e: e["occurred_at"], reverse=True)
 
+def fetch_historical_events(start_day, end_day):
+    """Compatibilidad con /importar_historico: devuelve (eventos, errores)."""
+    if end_day < start_day:
+        raise ValueError("La fecha final no puede ser anterior a la inicial.")
+    events, errors = [], []
+    day = start_day
+    while day <= end_day:
+        try:
+            events.extend(fetch_day(day))
+        except requests.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            if status == 404:
+                errors.append(f"Sin catálogo publicado: {day:%d/%m/%Y}")
+            else:
+                errors.append(f"{day:%d/%m/%Y}: HTTP {status or '?'}")
+        except Exception as exc:
+            errors.append(f"{day:%d/%m/%Y}: {type(exc).__name__}: {exc}")
+        day += timedelta(days=1)
+
+    unique = {e["source_id"]: e for e in events}
+    ordered = sorted(unique.values(), key=lambda e: e["occurred_at"], reverse=True)
+    return ordered, errors
+
 def fetch_recent_events(limit=None):
+    """Lee hoy + ayer y conserva la interfaz histórica: (eventos, errores)."""
     now = datetime.now(TZ)
-    merged = {}
-    # Today + yesterday handles midnight and delayed publication.
-    for day in (now.date(), (now - timedelta(days=1)).date()):
-        for e in fetch_day(day):
-            merged[e["source_id"]] = e
-    events = sorted(merged.values(), key=lambda e: e["occurred_at"], reverse=True)
-    return events[:limit] if limit else events
+    events, errors = fetch_historical_events(
+        (now - timedelta(days=1)).date(),
+        now.date()
+    )
+    if limit is not None:
+        events = events[:limit]
+    return events, errors
 
 def fetch_recent_events_debug():
-    """Diagnostic payload used by the Discord bot."""
+    """Diagnóstico fresco sin romper la interfaz usada por Discord."""
     now = datetime.now(TZ)
-    today = fetch_day(now.date())
-    yesterday = fetch_day((now - timedelta(days=1)).date())
+    today, err_today = fetch_historical_events(now.date(), now.date())
+    yesterday_day = (now - timedelta(days=1)).date()
+    yesterday, err_yesterday = fetch_historical_events(yesterday_day, yesterday_day)
+
     merged = {e["source_id"]: e for e in yesterday}
     merged.update({e["source_id"]: e for e in today})
     all_events = sorted(merged.values(), key=lambda e: e["occurred_at"], reverse=True)
     newest = all_events[0] if all_events else None
     age_minutes = None
     if newest:
-        dt = datetime.fromisoformat(newest["occurred_at"])
-        age_minutes = max(0, (now - dt).total_seconds()/60)
+        age_minutes = max(0, (now - newest["occurred_at"]).total_seconds() / 60)
+
     return {
         "today_count": len(today),
         "yesterday_count": len(yesterday),
@@ -126,4 +153,5 @@ def fetch_recent_events_debug():
         "newest": newest,
         "newest_age_minutes": age_minutes,
         "events": all_events,
+        "errors": err_today + err_yesterday,
     }
