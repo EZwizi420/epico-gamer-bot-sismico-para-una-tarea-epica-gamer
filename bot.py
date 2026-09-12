@@ -1,5 +1,6 @@
 import ast
-import os, re, math, sqlite3, hashlib, threading, tempfile, resource, time
+import os, re, math, sqlite3, hashlib, threading, tempfile, resource
+import time as pytime
 from datetime import datetime, date, time, timedelta
 from pathlib import Path
 
@@ -24,7 +25,7 @@ EXCEL_PATH = os.getenv("EXCEL_PATH", "Proyecto_Tabla_de_datos_con_coordenadas.xl
 DB_PATH = os.getenv("DB_PATH", "bot_sismico.db")
 CHECK_MINUTES = int(os.getenv("CSN_CHECK_MINUTES", "5"))
 DEFAULT_MARGIN_HOURS = 2
-BOT_STARTED_AT = time.time()
+BOT_STARTED_AT = pytime.monotonic()
 
 def parse_datetime(value):
     if isinstance(value, datetime):
@@ -2018,7 +2019,7 @@ def _human_bytes(n):
         n /= 1024
 
 def _uptime_text():
-    sec=max(0,int(time.time()-BOT_STARTED_AT))
+    sec=max(0,int(pytime.monotonic()-BOT_STARTED_AT))
     days,sec=divmod(sec,86400)
     hours,sec=divmod(sec,3600)
     mins,_=divmod(sec,60)
