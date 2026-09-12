@@ -80,7 +80,7 @@ def proximity_score(prediction, event, default_margin_hours=2):
     # Reuse project helpers/field conventions.
     plat=float(prediction["latitude"]); plon=float(prediction["longitude"])
     elat=float(event["latitude"]); elon=float(event["longitude"])
-    distance=haversine_km(plat,plon,elat,elon)
+    distance=haversine(plat,plon,elat,elon)
     radius=max(float(prediction["radius_km"]),1e-9)
     # 100% at same point, 50% at strict radius, fades to 0 at 2x radius.
     spatial=_clamp01(1.0-distance/(2.0*radius))
