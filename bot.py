@@ -10,6 +10,7 @@ from openpyxl import load_workbook
 
 from csn import fetch_recent_events, fetch_historical_events
 from dashboard import run_dashboard
+from evaluator import evaluate_real as shared_evaluate_real
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 EXCEL_PATH = os.getenv("EXCEL_PATH", "Proyecto_Tabla_de_datos_con_coordenadas.xlsx")
@@ -356,26 +357,8 @@ def real_window_finished(p):
     return datetime.now() > end_dt
 
 def evaluate_real(p, es):
-    rad = radius((p["mag_min"] + p["mag_max"]) / 2, p["zone_type"])
-    matches, candidates = [], []
-
-    for e in es:
-        when = parse_datetime(e["occurred_at"])
-        dist = haversine(p["latitude"],p["longitude"],e["latitude"],e["longitude"])
-        t_ok = real_time_ok(when,p)
-        m_ok = p["mag_min"] <= e["magnitude"] <= p["mag_max"]
-        g_ok = dist <= rad
-        x = {"e":e,"t":t_ok,"m":m_ok,"g":g_ok,"dist":dist}
-        candidates.append(x)
-        if t_ok and m_ok and g_ok:
-            matches.append(x)
-
-    # Mejor coincidencia: menor distancia; luego magnitud más central.
-    center = (p["mag_min"] + p["mag_max"]) / 2
-    matches.sort(key=lambda x:(x["dist"], abs(x["e"]["magnitude"]-center)))
-
-    status = "ACERTADA" if matches else ("NO ACERTADA" if real_window_finished(p) else "PENDIENTE")
-    return status, (matches[0] if matches else None), rad, candidates
+    # Fuente única de verdad compartida con el dashboard web.
+    return shared_evaluate_real(p, es)
 
 def get_real_group(group_name=None):
     with connect() as con:
