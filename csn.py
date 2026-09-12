@@ -1,136 +1,129 @@
 import re
+import time
+import requests
+from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urljoin
 
-import requests
-from bs4 import BeautifulSoup
+BASE = "https://www.sismologia.cl"
+TZ = ZoneInfo("America/Santiago")
 
-BASE_URL = "https://www.sismologia.cl/"
-HEADERS = {"User-Agent": "BotSismicoEducativo/0.6 (+Discord; lectura respetuosa CSN)"}
-REPORT_RE = re.compile(r"/sismicidad/informes/\d{4}/\d{2}/(\d+)\.html", re.I)
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/152.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-CL,es;q=0.9,en;q=0.7",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
-def _num(text):
-    if text is None:
+def _daily_url(day):
+    return f"{BASE}/sismicidad/catalogo/{day:%Y/%m}/{day:%Y%m%d}.html"
+
+def _fresh_get(url, timeout=25):
+    # Query string + no-cache headers prevent stale CDN/proxy responses.
+    sep = "&" if "?" in url else "?"
+    fresh_url = f"{url}{sep}_bot_ts={time.time_ns()}"
+    r = requests.get(fresh_url, headers=HEADERS, timeout=timeout)
+    r.raise_for_status()
+    return r
+
+def _num(txt):
+    m = re.search(r"-?\d+(?:[.,]\d+)?", txt or "")
+    return float(m.group(0).replace(",", ".")) if m else None
+
+def _parse_datetime(txt):
+    m = re.search(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", txt or "")
+    if not m:
         return None
-    m = re.search(r"-?\d+(?:[.,]\d+)?", str(text))
-    return float(m.group().replace(",", ".")) if m else None
+    return datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
 
-def catalog_url_for_day(day):
-    return f"{BASE_URL}sismicidad/catalogo/{day:%Y}/{day:%m}/{day:%Y%m%d}.html"
-
-def _parse_catalog_html(html, page_url):
-    """Lee directamente las filas del catálogo diario del CSN."""
+def fetch_day(day):
+    url = _daily_url(day)
+    html = _fresh_get(url).text
     soup = BeautifulSoup(html, "html.parser")
-    events, errors = [], []
+    events = []
 
+    # The official daily catalogue is a table. Parse rows instead of relying on
+    # report-detail pages, which may lag or be cached independently.
     for tr in soup.find_all("tr"):
-        cells = tr.find_all(["td", "th"])
+        cells = tr.find_all("td")
         if len(cells) < 5:
             continue
 
-        # La tabla visible tiene:
-        # Fecha Local/Lugar | Fecha UTC | Latitud/Longitud | Profundidad | Magnitud
-        c0 = " ".join(cells[0].stripped_strings)
-        c1 = " ".join(cells[1].stripped_strings)
-        c2 = " ".join(cells[2].stripped_strings)
-        c3 = " ".join(cells[3].stripped_strings)
-        c4 = " ".join(cells[4].stripped_strings)
+        local_cell = cells[0]
+        local_text = " ".join(local_cell.stripped_strings)
+        occurred = _parse_datetime(local_text)
+        if not occurred:
+            continue
 
-        dtm = re.search(r"(20\d{2}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", c0)
-        if not dtm:
-            continue  # encabezado u otra fila
+        # Place is the text in the first cell after the date/time link/text.
+        place = local_text
+        place = re.sub(r"^\s*\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s*", "", place).strip()
 
-        try:
-            local_dt = datetime.strptime(
-                f"{dtm.group(1)} {dtm.group(2)}", "%Y-%m-%d %H:%M:%S"
-            )
+        coord_text = " ".join(cells[2].stripped_strings)
+        nums = re.findall(r"-?\d+(?:[.,]\d+)?", coord_text)
+        if len(nums) < 2:
+            continue
+        lat = float(nums[0].replace(",", "."))
+        lon = float(nums[1].replace(",", "."))
 
-            # Lugar = texto restante de la primera celda.
-            place = re.sub(
-                r"20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}", "", c0, count=1
-            ).strip()
+        depth = _num(" ".join(cells[3].stripped_strings))
+        mag = _num(" ".join(cells[4].stripped_strings))
+        if mag is None:
+            continue
 
-            coords = re.findall(r"-?\d+(?:[.,]\d+)?", c2)
-            if len(coords) < 2:
-                raise ValueError(f"coordenadas no reconocidas: {c2!r}")
-            lat = float(coords[0].replace(",", "."))
-            lon = float(coords[1].replace(",", "."))
+        a = local_cell.find("a", href=True)
+        source_url = urljoin(BASE, a["href"]) if a else url
 
-            depth = _num(c3)
-            mag = _num(c4)
-            if mag is None:
-                raise ValueError(f"magnitud no reconocida: {c4!r}")
+        # Stable ID from the actual event fields. This avoids duplicates even if
+        # the CSN changes the report URL.
+        source_id = f"CSN:{occurred:%Y%m%d%H%M%S}:{lat:.4f}:{lon:.4f}"
 
-            a = cells[0].find("a", href=True)
-            report_url = urljoin(page_url, a["href"]) if a else page_url
-            mid = REPORT_RE.search(report_url)
+        events.append({
+            "source_id": source_id,
+            "occurred_at": occurred.isoformat(),
+            "place": place or "Sin referencia",
+            "latitude": lat,
+            "longitude": lon,
+            "depth_km": depth,
+            "magnitude": mag,
+            "source_url": source_url,
+        })
 
-            # Preferimos ID oficial del informe. Si no existe, generamos una clave
-            # estable con fecha/hora+coordenadas para evitar duplicados.
-            source_id = (
-                mid.group(1)
-                if mid
-                else f"{local_dt:%Y%m%d%H%M%S}_{lat:.3f}_{lon:.3f}"
-            )
-
-            utc_dt = None
-            um = re.search(r"(20\d{2}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})", c1)
-            if um:
-                utc_dt = datetime.strptime(
-                    f"{um.group(1)} {um.group(2)}", "%Y-%m-%d %H:%M:%S"
-                )
-
-            events.append({
-                "source": "CSN",
-                "source_id": source_id,
-                # El motor compara con el Excel usando HORA LOCAL.
-                "occurred_at": local_dt,
-                "occurred_at_utc": utc_dt,
-                "place": place,
-                "magnitude": mag,
-                "latitude": lat,
-                "longitude": lon,
-                "depth_km": depth,
-                "url": report_url,
-            })
-        except Exception as exc:
-            errors.append(f"Fila {c0[:45]!r}: {exc}")
-
-    return events, errors
-
-def fetch_catalog_day(day):
-    url = catalog_url_for_day(day)
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    if r.status_code == 404:
-        return [], [f"Sin catálogo publicado: {day:%d/%m/%Y}"]
-    r.raise_for_status()
-    return _parse_catalog_html(r.text, url)
-
-def fetch_historical_events(start_day, end_day):
-    if end_day < start_day:
-        raise ValueError("La fecha final no puede ser anterior a la inicial.")
-    events, errors = [], []
-    day = start_day
-    while day <= end_day:
-        try:
-            ev, er = fetch_catalog_day(day)
-            events.extend(ev)
-            errors.extend(er)
-        except Exception as exc:
-            errors.append(f"{day:%d/%m/%Y}: {exc}")
-        day += timedelta(days=1)
-    return events, errors
+    # Newest first and unique by source_id.
+    unique = {e["source_id"]: e for e in events}
+    return sorted(unique.values(), key=lambda e: e["occurred_at"], reverse=True)
 
 def fetch_recent_events(limit=None):
-    """Lee completos los catálogos de hoy y ayer usando la fecha local de Chile.
+    now = datetime.now(TZ)
+    merged = {}
+    # Today + yesterday handles midnight and delayed publication.
+    for day in (now.date(), (now - timedelta(days=1)).date()):
+        for e in fetch_day(day):
+            merged[e["source_id"]] = e
+    events = sorted(merged.values(), key=lambda e: e["occurred_at"], reverse=True)
+    return events[:limit] if limit else events
 
-    `limit=None` evita perder sismos cuando hay más de 30 eventos entre consultas.
-    Se conserva el parámetro para compatibilidad con versiones anteriores.
-    """
-    chile_today = datetime.now(ZoneInfo("America/Santiago")).date()
-    events, errors = fetch_historical_events(chile_today - timedelta(days=1), chile_today)
-    events.sort(key=lambda e: e["occurred_at"], reverse=True)
-    if limit is None:
-        return events, errors
-    return events[:limit], errors
+def fetch_recent_events_debug():
+    """Diagnostic payload used by the Discord bot."""
+    now = datetime.now(TZ)
+    today = fetch_day(now.date())
+    yesterday = fetch_day((now - timedelta(days=1)).date())
+    merged = {e["source_id"]: e for e in yesterday}
+    merged.update({e["source_id"]: e for e in today})
+    all_events = sorted(merged.values(), key=lambda e: e["occurred_at"], reverse=True)
+    newest = all_events[0] if all_events else None
+    age_minutes = None
+    if newest:
+        dt = datetime.fromisoformat(newest["occurred_at"])
+        age_minutes = max(0, (now - dt).total_seconds()/60)
+    return {
+        "today_count": len(today),
+        "yesterday_count": len(yesterday),
+        "total_count": len(all_events),
+        "newest": newest,
+        "newest_age_minutes": age_minutes,
+        "events": all_events,
+    }

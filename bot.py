@@ -16,7 +16,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 
-from csn import fetch_recent_events, fetch_historical_events
+from csn import fetch_recent_events, fetch_recent_events_debug, fetch_historical_events
 from dashboard import run_dashboard
 from evaluator import evaluate_real as shared_evaluate_real
 
@@ -678,15 +678,34 @@ async def on_ready():
 async def c_import(i:discord.Interaction):
     n,e=import_excel();await i.response.send_message(f"📥 {n} predicciones importadas."+("\n⚠️ "+"; ".join(e[:3]) if e else ""))
 
-@bot.tree.command(name="actualizar_csn",description="Consulta ahora los últimos eventos reales del CSN")
-async def c_csn(i:discord.Interaction):
-    await i.response.defer()
+@bot.tree.command(name="actualizar_csn",description="Fuerza una sincronización fresca con el catálogo oficial CSN")
+async def c_update_csn(i:discord.Interaction):
+    await i.response.defer(thinking=True, ephemeral=True)
     try:
-        total,new,errs=update_csn()
-        msg=f"🌐 CSN consultado: **{total}** informes leídos, **{new}** nuevos guardados."
-        if errs:msg+=f"\n⚠️ {len(errs)} informe(s) no pudieron interpretarse. Primero: `{errs[0][:250]}`"
-        await i.followup.send(msg[:1900])
-    except Exception as e:await i.followup.send(f"❌ Error consultando CSN: `{e}`")
+        fetched=fetch_recent_events(limit=None)
+        newly_saved=[]
+        for e in fetched:
+            if save_event(e):
+                newly_saved.append(e)
+        feed_sent=await send_csn_feed_for_new_events(newly_saved) if newly_saved else 0
+        alerts_sent=await send_alerts_for_new_events(newly_saved) if newly_saved else 0
+        newest=fetched[0] if fetched else None
+        newest_txt="sin eventos"
+        if newest:
+            dt=parse_datetime(newest["occurred_at"])
+            newest_txt=f"{dt:%d/%m/%Y %H:%M:%S} · M{newest['magnitude']:.1f} · {newest['place']}"
+        await i.followup.send(
+            f"🌐 **CSN actualizado**\n"
+            f"Informes frescos leídos: **{len(fetched)}**\n"
+            f"Nuevos guardados: **{len(newly_saved)}**\n"
+            f"Publicados en #sismos: **{feed_sent}**\n"
+            f"Alertas de predicción: **{alerts_sent}**\n"
+            f"Último evento leído: **{newest_txt}**",
+            ephemeral=True
+        )
+    except Exception as exc:
+        await i.followup.send(f"❌ Error actualizando CSN: `{type(exc).__name__}: {str(exc)[:900]}`",ephemeral=True)
+
 
 @bot.tree.command(name="analizar",description="Evalúa PRUEBA usando únicamente eventos reales CSN guardados")
 async def c_an(i:discord.Interaction,margen_horas:app_commands.Range[int,1,2]=2):
@@ -725,44 +744,50 @@ async def c_state(i:discord.Interaction):
     await i.response.send_message(f"🌐 Eventos CSN guardados: **{row['n']}**\nÚltimo: **{row['last'] or 'ninguno'}**")
 
 
-@bot.tree.command(name="csn_diagnostico",description="Compara el catálogo actual del CSN con la base local del bot")
+@bot.tree.command(name="csn_diagnostico",description="Compara el catálogo CSN fresco con SQLite y detecta retrasos")
 async def c_csn_diag(i:discord.Interaction):
-    await i.response.defer(ephemeral=True)
+    await i.response.defer(thinking=True, ephemeral=True)
     try:
-        fetched,errs=fetch_recent_events()
-        remote={str(e["source_id"]):e for e in fetched}
+        d=fetch_recent_events_debug()
+        fetched=d["events"]
         with connect() as con:
-            rows=con.execute("SELECT source_id,occurred_at,place,magnitude FROM observed_events WHERE source='CSN'").fetchall()
-        local={str(r["source_id"]):r for r in rows}
-        missing=[e for sid,e in remote.items() if sid not in local]
-        latest_web=max(fetched,key=lambda e:e["occurred_at"]) if fetched else None
-        latest_db=max(rows,key=lambda r:parse_datetime(r["occurred_at"])) if rows else None
-        synced=(len(missing)==0)
-        e=ui_embed("📡 Diagnóstico CSN",color=(discord.Color.green() if synced else discord.Color.red()))
-        e.add_field(name="Catálogo hoy + ayer",value=f"**{len(fetched)}** eventos",inline=True)
-        e.add_field(name="Faltantes en SQLite",value=f"**{len(missing)}**",inline=True)
-        e.add_field(name="Estado",value=("🟢 Sincronizado" if synced else "🔴 Desactualizado"),inline=True)
-        if latest_web:
-            e.add_field(name="🌐 Último en CSN",value=f"{latest_web['occurred_at']:%d/%m/%Y %H:%M:%S} · M{latest_web['magnitude']:.1f}\n{latest_web['place']}",inline=False)
-        if latest_db:
-            dt=parse_datetime(latest_db["occurred_at"])
-            e.add_field(name="💾 Último guardado",value=f"{dt:%d/%m/%Y %H:%M:%S} · M{latest_db['magnitude']:.1f}\n{latest_db['place']}",inline=False)
-        if missing:
-            sample=missing[:5]
-            e.add_field(name="⚠️ Ejemplos faltantes",value="\n".join(f"• {x['occurred_at']:%H:%M:%S} M{x['magnitude']:.1f} — {x['place']}" for x in sample),inline=False)
-        if errs:
-            e.add_field(name="Avisos del parser",value=f"{len(errs)} aviso(s). Primero: {errs[0][:300]}",inline=False)
-        await i.followup.send(embed=e,ephemeral=True)
-    except Exception as exc:
-        await i.followup.send(f"❌ Diagnóstico CSN falló: `{exc}`",ephemeral=True)
+            db_ids={r[0] for r in con.execute("SELECT source_id FROM observed_events").fetchall()}
+        missing=[e for e in fetched if e["source_id"] not in db_ids]
+        db_events=events()
+        newest_web=d["newest"]
+        newest_db=db_events[0] if db_events else None
 
-def parse_user_date(text):
-    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(text.strip(), fmt).date()
-        except ValueError:
-            pass
-    raise ValueError("Usa DD/MM/AAAA, por ejemplo 10/09/2026.")
+        # "Synced" requires IDs to match AND newest timestamps to match.
+        same_latest=False
+        if newest_web and newest_db:
+            same_latest=(parse_datetime(newest_web["occurred_at"]) == parse_datetime(newest_db["occurred_at"]))
+        elif newest_web is None and newest_db is None:
+            same_latest=True
+
+        state="🟢 Sincronizado" if not missing and same_latest else "🔴 DESACTUALIZADO"
+        age=d["newest_age_minutes"]
+        age_txt="—" if age is None else f"{age:.0f} min"
+
+        def fmt(e):
+            if not e: return "—"
+            dt=parse_datetime(e["occurred_at"])
+            return f"{dt:%d/%m/%Y %H:%M:%S} · M{e['magnitude']:.1f}\n{e['place']}"
+
+        embed=discord.Embed(title="🛰️ Diagnóstico CSN fresco",color=(discord.Color.green() if state.startswith("🟢") else discord.Color.red()))
+        embed.add_field(name="Hoy",value=str(d["today_count"]),inline=True)
+        embed.add_field(name="Ayer",value=str(d["yesterday_count"]),inline=True)
+        embed.add_field(name="Faltantes SQLite",value=str(len(missing)),inline=True)
+        embed.add_field(name="Estado",value=state,inline=True)
+        embed.add_field(name="Edad último CSN",value=age_txt,inline=True)
+        embed.add_field(name="🌐 Último CSN",value=fmt(newest_web),inline=False)
+        embed.add_field(name="💾 Último guardado",value=fmt(newest_db),inline=False)
+        if missing:
+            sample="\n".join(f"• {parse_datetime(e['occurred_at']):%H:%M:%S} M{e['magnitude']:.1f} {e['place']}" for e in missing[:8])
+            embed.add_field(name="Eventos faltantes",value=sample[:1000],inline=False)
+        await i.followup.send(embed=embed,ephemeral=True)
+    except Exception as exc:
+        await i.followup.send(f"❌ Diagnóstico falló: `{type(exc).__name__}: {str(exc)[:900]}`",ephemeral=True)
+
 
 @bot.tree.command(
     name="importar_historico",
