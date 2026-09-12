@@ -54,6 +54,16 @@ def evaluate_real(p,es,now=None):
     return status,(matches[0] if matches else None),rad,candidates
 
 
+
+def _field(row, *names, default=None):
+    """Read first available key from dict/sqlite3.Row without relying on .get()."""
+    for name in names:
+        try:
+            return row[name]
+        except (KeyError, IndexError, TypeError):
+            pass
+    return default
+
 # ---------- v1.6: SCORE DE PROXIMIDAD ----------
 # IMPORTANT: this score is descriptive. It never changes the strict 3/3 result.
 
@@ -73,27 +83,45 @@ def _range_closeness(value, low, high, tolerance):
 
 def proximity_score(prediction, event, default_margin_hours=2):
     """
-    Score 0-100:
-      40% spatial + 30% magnitude + 30% temporal.
-    Strict pass/fail remains evaluate_real()/evaluate_prediction().
+    Descriptive 0-100 score. Does not alter the strict 3/3 evaluator.
+    Accepts the project's sqlite3.Row prediction schema.
     """
-    # Reuse project helpers/field conventions.
-    plat=float(prediction["latitude"]); plon=float(prediction["longitude"])
-    elat=float(event["latitude"]); elon=float(event["longitude"])
+    plat=float(_field(prediction,"lat","latitude"))
+    plon=float(_field(prediction,"lon","longitude"))
+    elat=float(_field(event,"lat","latitude"))
+    elon=float(_field(event,"lon","longitude"))
     distance=haversine(plat,plon,elat,elon)
-    radius=max(float(prediction["radius_km"]),1e-9)
-    # 100% at same point, 50% at strict radius, fades to 0 at 2x radius.
+
+    # Existing project schema uses radius; newer rows may use radius_km.
+    radius=max(float(_field(prediction,"radius","radius_km",default=75.0)),1e-9)
     spatial=_clamp01(1.0-distance/(2.0*radius))
 
-    mag=float(event["magnitude"])
-    mmin=float(prediction["mag_min"]); mmax=float(prediction["mag_max"])
+    mag=float(_field(event,"mag","magnitude"))
+    mmin=float(_field(prediction,"mag_min","magnitude_min"))
+    mmax=float(_field(prediction,"mag_max","magnitude_max"))
     mag_width=max(mmax-mmin,0.1)
     magnitude=_range_closeness(mag,mmin,mmax,mag_width)
 
-    edt=parse_datetime(event["occurred_at"])
-    pstart=parse_datetime(prediction["start_at"])
-    pend=parse_datetime(prediction["end_at"])
-    margin_h=float(prediction.get("margin_hours") or default_margin_hours)
+    edt=parse_datetime(_field(event,"occurred_at","datetime","date"))
+    margin_h=float(_field(prediction,"margin_hours",default=default_margin_hours) or default_margin_hours)
+
+    # Actual project predictions use date_start/date_end + a daily time window.
+    ds=_field(prediction,"date_start")
+    de=_field(prediction,"date_end")
+    ts=_field(prediction,"daily_time_start",default="00:00")
+    te=_field(prediction,"daily_time_end",default="23:59:59")
+    if ds and de:
+        pstart=parse_datetime(f"{ds}T{ts}")
+        pend=parse_datetime(f"{de}T{te}")
+    else:
+        pstart=parse_datetime(_field(prediction,"start_at","start"))
+        pend=parse_datetime(_field(prediction,"end_at","end"))
+
+    # Normalize naive project window to the event timezone when needed.
+    if edt.tzinfo is not None and pstart.tzinfo is None:
+        pstart=pstart.replace(tzinfo=edt.tzinfo)
+        pend=pend.replace(tzinfo=edt.tzinfo)
+
     if pstart <= edt <= pend:
         temporal=1.0
         time_error_h=0.0
@@ -108,6 +136,7 @@ def proximity_score(prediction, event, default_margin_hours=2):
         "magnitude_pct": round(magnitude*100,1),
         "temporal_pct": round(temporal*100,1),
         "distance_km": round(distance,2),
+        "radius_km": round(radius,2),
         "time_error_hours": round(time_error_h,2),
     }
 
