@@ -1,6 +1,5 @@
 import ast
-import os, re, math, sqlite3, hashlib, threading, tempfile, json
-from collections import defaultdict, deque
+import os, re, math, sqlite3, hashlib, threading, tempfile
 from datetime import datetime, date, time, timedelta
 from pathlib import Path
 
@@ -25,17 +24,6 @@ EXCEL_PATH = os.getenv("EXCEL_PATH", "Proyecto_Tabla_de_datos_con_coordenadas.xl
 DB_PATH = os.getenv("DB_PATH", "bot_sismico.db")
 CHECK_MINUTES = int(os.getenv("CSN_CHECK_MINUTES", "5"))
 DEFAULT_MARGIN_HOURS = 2
-XAI_API_KEY = os.getenv("XAI_API_KEY", "")
-XAI_MODEL = os.getenv("XAI_MODEL", "grok-4-fast")
-XAI_API_URL = os.getenv("XAI_API_URL", "https://api.x.ai/v1/chat/completions")
-
-# OpenAI remains optional as a fallback if you later add credits.
-AI_API_KEY = os.getenv("AI_API_KEY", "")
-AI_MODEL = os.getenv("AI_MODEL", "gpt-5.6")
-AI_API_URL = os.getenv("AI_API_URL", "https://api.openai.com/v1/responses")
-
-AI_MAX_OUTPUT_TOKENS = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "700"))
-AI_HISTORY_TURNS = int(os.getenv("AI_HISTORY_TURNS", "6"))
 
 def parse_datetime(value):
     if isinstance(value, datetime):
@@ -1506,200 +1494,6 @@ async def c_radio(i:discord.Interaction,magnitud:float,tipo_zona:str=""):
 
 
 
-# ---------- V1.5.3: CHAT IA GENERAL ----------
-
-_ai_history = defaultdict(lambda: deque(maxlen=max(2, AI_HISTORY_TURNS * 2)))
-
-def ai_project_snapshot():
-    """Contexto pequeño y de solo lectura para preguntas sobre este proyecto."""
-    try:
-        ps=get_real_group()
-        es=events()
-        hit=miss=pending=0
-        groups={}
-        for p in ps:
-            st,_,_,_=evaluate_real(p,es)
-            if st=="ACERTADA": hit+=1
-            elif st=="NO ACERTADA": miss+=1
-            else: pending+=1
-            groups.setdefault(p["group_name"],[0,0,0])
-            idx=0 if st=="ACERTADA" else (1 if st=="NO ACERTADA" else 2)
-            groups[p["group_name"]][idx]+=1
-        ranking="; ".join(f"{g}: {v[0]} aciertos, {v[1]} fallos, {v[2]} pendientes" for g,v in sorted(groups.items()))
-        recent=[]
-        for e in es[:5]:
-            recent.append(f"M{e['magnitude']:.1f} {e['place']} ({e['occurred_at']})")
-        return (
-            f"Proyecto sísmico actual: {len(ps)} predicciones; {hit} aciertos; "
-            f"{miss} no acertadas; {pending} pendientes. "
-            f"Por IA: {ranking or 'sin datos'}. "
-            f"Eventos CSN recientes guardados: {' | '.join(recent) if recent else 'sin datos'}."
-        )
-    except Exception as exc:
-        return f"El contexto del proyecto no pudo leerse en este momento: {type(exc).__name__}."
-
-def ai_system_prompt():
-    return (
-        "Eres el asistente general de un bot privado de Discord. Puedes conversar sobre temas generales, "
-        "explicar materias, ayudar con ideas, matemáticas y programación, y también responder sobre el "
-        "proyecto sísmico cuando el usuario lo pregunte. No inventes datos actuales del CSN. "
-        "Cuando uses el contexto sísmico incluido, aclara que son datos del proyecto. "
-        "Las estimaciones sísmicas del proyecto son experimentales y no constituyen predicciones científicamente validadas. "
-        "Responde en español salvo que el usuario pida otro idioma. Sé claro y relativamente breve."
-    )
-
-def _call_grok(messages):
-    if not XAI_API_KEY:
-        raise RuntimeError("XAI_API_KEY no está configurada")
-    payload = {
-        "model": XAI_MODEL,
-        "messages": messages,
-        "max_tokens": AI_MAX_OUTPUT_TOKENS,
-        "temperature": 0.7,
-    }
-    r = requests.post(
-        XAI_API_URL,
-        headers={
-            "Authorization": f"Bearer {XAI_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=75,
-    )
-    if not r.ok:
-        try:
-            detail = r.json()
-            msg = detail.get("error", {}).get("message") or str(detail)
-        except Exception:
-            msg = r.text[:500]
-        raise RuntimeError(f"Grok/xAI {r.status_code}: {msg[:500]}")
-    data = r.json()
-    try:
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception:
-        raise RuntimeError("Grok/xAI no devolvió texto")
-
-def _call_openai_fallback(user_id, question, history):
-    if not XAI_API_KEY and not AI_API_KEY:
-        raise RuntimeError("OpenAI fallback no configurado")
-    input_items = [{
-        "role": "system",
-        "content": [{"type": "input_text", "text": ai_system_prompt()+"\n\n"+ai_project_snapshot()}],
-    }]
-    for role, text in history:
-        input_items.append({"role": role, "content": [{"type": "input_text", "text": text}]})
-    input_items.append({"role": "user", "content": [{"type": "input_text", "text": question}]})
-    payload = {
-        "model": AI_MODEL,
-        "input": input_items,
-        "max_output_tokens": AI_MAX_OUTPUT_TOKENS,
-    }
-    r = requests.post(
-        AI_API_URL,
-        headers={"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=75,
-    )
-    if not r.ok:
-        raise RuntimeError(f"OpenAI {r.status_code}: {r.text[:350]}")
-    data = r.json()
-    answer = data.get("output_text")
-    if not answer:
-        parts = []
-        for item in data.get("output", []):
-            if item.get("type") == "message":
-                for c in item.get("content", []):
-                    if c.get("type") == "output_text" and c.get("text"):
-                        parts.append(c["text"])
-        answer = "\n".join(parts).strip()
-    if not answer:
-        raise RuntimeError("OpenAI no devolvió texto")
-    return answer
-
-def call_ai_sync(user_id, question):
-    if not XAI_API_KEY and not AI_API_KEY:
-        raise RuntimeError("Configura XAI_API_KEY en Railway para activar /chat")
-
-    history = list(_ai_history[str(user_id)])
-    system = ai_system_prompt() + "\n\n" + ai_project_snapshot()
-    messages = [{"role": "system", "content": system}]
-    for role, text in history:
-        messages.append({"role": role, "content": text})
-    messages.append({"role": "user", "content": question})
-
-    grok_error = None
-    answer = None
-
-    if XAI_API_KEY:
-        try:
-            answer = _call_grok(messages)
-        except Exception as exc:
-            grok_error = exc
-
-    # Optional fallback only when an OpenAI key is present.
-    if not answer and AI_API_KEY:
-        try:
-            answer = _call_openai_fallback(user_id, question, history)
-        except Exception as openai_exc:
-            if grok_error:
-                raise RuntimeError(f"{grok_error} | Fallback: {openai_exc}")
-            raise
-
-    if not answer:
-        raise grok_error or RuntimeError("No hay proveedor de IA disponible")
-
-    _ai_history[str(user_id)].append(("user", question))
-    _ai_history[str(user_id)].append(("assistant", answer))
-    return answer
-
-async def send_ai_answer(interaction, question):
-    await interaction.response.defer(thinking=True)
-    try:
-        import asyncio
-        answer=await asyncio.to_thread(call_ai_sync, interaction.user.id, question)
-        # Discord messages cap at 2000 chars. Split cleanly.
-        chunks=[]
-        rest=answer.strip()
-        while rest:
-            if len(rest)<=1900:
-                chunks.append(rest); break
-            cut=rest.rfind("\n",0,1900)
-            if cut<900: cut=rest.rfind(" ",0,1900)
-            if cut<900: cut=1900
-            chunks.append(rest[:cut].strip())
-            rest=rest[cut:].strip()
-        await interaction.followup.send(chunks[0] if chunks else "No obtuve respuesta.")
-        for chunk in chunks[1:]:
-            await interaction.followup.send(chunk)
-    except Exception as exc:
-        await interaction.followup.send(
-            "❌ **Chat IA no disponible**\n"
-            f"`{str(exc)[:700]}`\n\n"
-            "Para Grok comprueba `XAI_API_KEY` y `XAI_MODEL` en Railway.",
-            ephemeral=True
-        )
-
-class AIChatModal(discord.ui.Modal, title="💬 Hablar con la IA"):
-    question=discord.ui.TextInput(
-        label="¿Qué quieres preguntarle?",
-        style=discord.TextStyle.paragraph,
-        placeholder="Puede ser de sismos, programación, ciencia, ideas... lo que quieras.",
-        min_length=1,
-        max_length=1500
-    )
-    async def on_submit(self, interaction):
-        await send_ai_answer(interaction, str(self.question))
-
-@bot.tree.command(name="chat",description="Habla con la IA del bot sobre temas generales")
-@app_commands.describe(pregunta="Tu pregunta para la IA")
-async def c_chat(i:discord.Interaction,pregunta:str):
-    await send_ai_answer(i,pregunta)
-
-@bot.tree.command(name="chat_nuevo",description="Borra el contexto reciente de tu conversación con la IA")
-async def c_chat_new(i:discord.Interaction):
-    _ai_history.pop(str(i.user.id),None)
-    await i.response.send_message("🧹 Conversación reciente de IA reiniciada.",ephemeral=True)
-
 
 # ---------- V1.2: INTERFAZ VISUAL ----------
 
@@ -1786,7 +1580,6 @@ def build_help_embed():
     e.add_field(name="🧮 Calculadora",value="Desde `/panel` → **Calculadora**, o `/calcular`, `/distancia`, `/comparar`, `/radio`.",inline=False)
     e.add_field(name="📊 Resultados",value="`/ranking` · `/historial` · `/integridad`",inline=False)
     e.add_field(name="🔔 Alertas",value="`/canal_alertas` · `/estado_alertas` · `/desactivar_alertas`",inline=False)
-    e.add_field(name="💬 Chat IA",value="`/chat` para conversar de temas generales · `/chat_nuevo` para reiniciar el contexto.",inline=False)
     e.set_footer(text="Los botones del panel no modifican predicciones por sí solos.")
     return e
 
@@ -2138,15 +1931,6 @@ class MainPanel(discord.ui.View):
     async def help(self,interaction,button):
         await interaction.response.send_message(embed=build_help_embed(),ephemeral=True)
 
-    @discord.ui.button(label="Chat IA", emoji="💬", style=discord.ButtonStyle.success, row=2)
-    async def ai_chat(self,interaction,button):
-        if not AI_API_KEY:
-            await interaction.response.send_message(
-                "⚠️ El chat IA no tiene una clave configurada. Añade `XAI_API_KEY` en Railway para usar Grok.",
-                ephemeral=True
-            )
-            return
-        await interaction.response.send_modal(AIChatModal())
 
 @bot.tree.command(name="panel",description="Abre el centro de control visual del Bot Sísmico")
 async def c_panel(i:discord.Interaction):
@@ -2165,7 +1949,7 @@ async def c_panel(i:discord.Interaction):
     e.add_field(name="📑 Correlaciones",value=f"**{n_corr}**",inline=True)
     e.add_field(name="🔔 Alertas",value=("Configuradas" if channel_id else "Sin canal"),inline=True)
     e.add_field(name="📡 Monitor",value=f"Cada **{CHECK_MINUTES} min**",inline=True)
-    e.set_footer(text="Panel v1.5.3 • Chat IA + Sismologia Lab")
+    e.set_footer(text="Panel v1.5.7 • Sismologia Lab")
     await i.response.send_message(embed=e,view=MainPanel())
 
 @bot.tree.command(name="ayuda",description="Muestra una guía limpia de los comandos del bot")

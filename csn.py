@@ -120,38 +120,72 @@ def fetch_historical_events(start_day, end_day):
     ordered = sorted(unique.values(), key=lambda e: e["occurred_at"], reverse=True)
     return ordered, errors
 
+def _candidate_catalog_days():
+    """
+    Consulta un margen alrededor de las fechas de Chile y UTC.
+    Evita perder eventos al cruzar medianoche UTC/local o por publicación tardía.
+    """
+    now_cl = datetime.now(TZ)
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    bases = {now_cl.date(), now_utc.date()}
+    days = set()
+    for base in bases:
+        for offset in (-2, -1, 0, 1):
+            days.add(base + timedelta(days=offset))
+    return sorted(days)
+
 def fetch_recent_events(limit=None):
-    """Lee hoy + ayer y conserva la interfaz histórica: (eventos, errores)."""
-    now = datetime.now(TZ)
-    events, errors = fetch_historical_events(
-        (now - timedelta(days=1)).date(),
-        now.date()
-    )
-    if limit is not None:
-        events = events[:limit]
-    return events, errors
+    """Lee varios catálogos alrededor de la fecha Chile/UTC y devuelve (eventos, errores)."""
+    merged={}
+    errors=[]
+    for day in _candidate_catalog_days():
+        try:
+            for e in fetch_day(day):
+                merged[e["source_id"]]=e
+        except requests.HTTPError as exc:
+            status=getattr(exc.response,"status_code",None)
+            # A page for tomorrow may legitimately not exist yet.
+            if status not in (404,):
+                errors.append(f"{day:%d/%m/%Y}: HTTP {status or '?'}")
+        except Exception as exc:
+            errors.append(f"{day:%d/%m/%Y}: {type(exc).__name__}: {exc}")
+
+    events=sorted(merged.values(), key=lambda e:e["occurred_at"], reverse=True)
+    return (events[:limit] if limit is not None else events), errors
 
 def fetch_recent_events_debug():
-    """Diagnóstico fresco sin romper la interfaz usada por Discord."""
-    now = datetime.now(TZ)
-    today, err_today = fetch_historical_events(now.date(), now.date())
-    yesterday_day = (now - timedelta(days=1)).date()
-    yesterday, err_yesterday = fetch_historical_events(yesterday_day, yesterday_day)
+    days=_candidate_catalog_days()
+    counts={}
+    merged={}
+    errors=[]
+    for day in days:
+        try:
+            evs=fetch_day(day)
+            counts[day.isoformat()]=len(evs)
+            for e in evs:
+                merged[e["source_id"]]=e
+        except requests.HTTPError as exc:
+            status=getattr(exc.response,"status_code",None)
+            counts[day.isoformat()]=0
+            if status not in (404,):
+                errors.append(f"{day:%d/%m/%Y}: HTTP {status or '?'}")
+        except Exception as exc:
+            counts[day.isoformat()]=0
+            errors.append(f"{day:%d/%m/%Y}: {type(exc).__name__}: {exc}")
 
-    merged = {e["source_id"]: e for e in yesterday}
-    merged.update({e["source_id"]: e for e in today})
-    all_events = sorted(merged.values(), key=lambda e: e["occurred_at"], reverse=True)
-    newest = all_events[0] if all_events else None
-    age_minutes = None
+    events=sorted(merged.values(), key=lambda e:e["occurred_at"], reverse=True)
+    newest=events[0] if events else None
+    now=datetime.now(TZ)
+    age=None
     if newest:
-        age_minutes = max(0, (now - newest["occurred_at"]).total_seconds() / 60)
+        age=max(0,(now-newest["occurred_at"]).total_seconds()/60)
 
     return {
-        "today_count": len(today),
-        "yesterday_count": len(yesterday),
-        "total_count": len(all_events),
+        "catalog_days": days,
+        "counts": counts,
+        "total_count": len(events),
         "newest": newest,
-        "newest_age_minutes": age_minutes,
-        "events": all_events,
-        "errors": err_today + err_yesterday,
+        "newest_age_minutes": age,
+        "events": events,
+        "errors": errors,
     }
