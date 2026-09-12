@@ -1,12 +1,20 @@
 import ast
-import os, re, math, sqlite3, hashlib, threading
+import os, re, math, sqlite3, hashlib, threading, tempfile, json
+from collections import defaultdict, deque
 from datetime import datetime, date, time, timedelta
 from pathlib import Path
 
 import discord
+import requests
 from discord import app_commands
 from discord.ext import commands, tasks
 from openpyxl import load_workbook
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
 
 from csn import fetch_recent_events, fetch_historical_events
 from dashboard import run_dashboard
@@ -17,6 +25,11 @@ EXCEL_PATH = os.getenv("EXCEL_PATH", "Proyecto_Tabla_de_datos_con_coordenadas.xl
 DB_PATH = os.getenv("DB_PATH", "bot_sismico.db")
 CHECK_MINUTES = int(os.getenv("CSN_CHECK_MINUTES", "5"))
 DEFAULT_MARGIN_HOURS = 2
+AI_API_KEY = os.getenv("AI_API_KEY", "")
+AI_MODEL = os.getenv("AI_MODEL", "gpt-5.6")
+AI_API_URL = os.getenv("AI_API_URL", "https://api.openai.com/v1/responses")
+AI_MAX_OUTPUT_TOKENS = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "700"))
+AI_HISTORY_TURNS = int(os.getenv("AI_HISTORY_TURNS", "6"))
 
 def parse_datetime(value):
     if isinstance(value, datetime):
@@ -1111,6 +1124,167 @@ async def c_integrity(i:discord.Interaction):
     if changed_codes: msg+="\n\nModificadas: "+", ".join(changed_codes[:20])
     await i.response.send_message(msg[:1950])
 
+
+# ---------- V1.5.2: INFORMES PDF ----------
+
+def _pdf_safe(value):
+    if value is None:
+        return "-"
+    return str(value).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+def build_experiment_pdf(output_path, group_name=None):
+    """Genera un informe PDF usando el mismo evaluador oficial que Discord/dashboard."""
+    ps=get_real_group(group_name)
+    es=events()
+    styles=getSampleStyleSheet()
+    title=ParagraphStyle("ReportTitle", parent=styles["Title"], alignment=TA_CENTER, fontSize=20, leading=24, spaceAfter=8)
+    sub=ParagraphStyle("ReportSub", parent=styles["Normal"], alignment=TA_CENTER, fontSize=9, leading=12, textColor=colors.HexColor("#555555"), spaceAfter=14)
+    h2=ParagraphStyle("ReportH2", parent=styles["Heading2"], fontSize=13, leading=16, spaceBefore=8, spaceAfter=7)
+    body=ParagraphStyle("ReportBody", parent=styles["BodyText"], fontSize=8.5, leading=11)
+    small=ParagraphStyle("ReportSmall", parent=styles["BodyText"], fontSize=7.5, leading=9)
+
+    doc=SimpleDocTemplate(str(output_path), pagesize=landscape(A4), rightMargin=12*mm, leftMargin=12*mm, topMargin=12*mm, bottomMargin=12*mm,
+                          title="Sismologia Lab - Informe experimental")
+    story=[]
+    scope=(group_name.upper() if group_name else "TODAS LAS IA")
+    story.append(Paragraph("SISMOLOGIA LAB - INFORME EXPERIMENTAL", title))
+    story.append(Paragraph(f"Alcance: <b>{_pdf_safe(scope)}</b> | Generado: {datetime.now():%d/%m/%Y %H:%M} (Chile)", sub))
+    story.append(Paragraph("Este documento evalua estimaciones experimentales contra eventos registrados por el CSN. No constituye un sistema cientificamente validado de prediccion de terremotos.", body))
+    story.append(Spacer(1,5*mm))
+
+    results=[]
+    hit=miss=pending=0
+    for pred in ps:
+        st,b,rad,cands=evaluate_real(pred,es)
+        results.append((pred,st,b,rad,cands))
+        if st=="ACERTADA": hit+=1
+        elif st=="NO ACERTADA": miss+=1
+        else: pending+=1
+    closed=hit+miss
+    pct=(100.0*hit/closed) if closed else 0.0
+
+    summary=[["Predicciones","Acertadas","No acertadas","Pendientes","Precision cerrada","Eventos CSN"],
+             [str(len(ps)),str(hit),str(miss),str(pending),f"{pct:.1f}%" if closed else "-",str(len(es))]]
+    t=Table(summary, colWidths=[38*mm,35*mm,38*mm,35*mm,42*mm,35*mm])
+    t.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#1f2937")),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("ALIGN",(0,0),(-1,-1),"CENTER"),
+        ("GRID",(0,0),(-1,-1),0.4,colors.HexColor("#bbbbbb")),("BOTTOMPADDING",(0,0),(-1,-1),6),("TOPPADDING",(0,0),(-1,-1),6)
+    ]))
+    story.append(t)
+    story.append(Spacer(1,5*mm))
+
+    # Ranking uses exactly the same evaluation results.
+    story.append(Paragraph("Ranking por IA",h2))
+    groups={}
+    for pred,st,b,rad,cands in results:
+        g=pred["group_name"]
+        groups.setdefault(g,{"h":0,"m":0,"p":0})
+        if st=="ACERTADA": groups[g]["h"]+=1
+        elif st=="NO ACERTADA": groups[g]["m"]+=1
+        else: groups[g]["p"]+=1
+    rank=[]
+    for g,v in groups.items():
+        c=v["h"]+v["m"]
+        score=(100*v["h"]/c) if c else None
+        rank.append((score if score is not None else -1,g,v))
+    rank.sort(reverse=True)
+    rank_data=[["IA","Aciertos","Fallos","Pendientes","Precision"]]
+    for score,g,v in rank:
+        rank_data.append([g,str(v["h"]),str(v["m"]),str(v["p"]),f"{score:.1f}%" if score>=0 else "-"])
+    if len(rank_data)==1: rank_data.append(["-","0","0","0","-"])
+    rt=Table(rank_data, colWidths=[55*mm,30*mm,30*mm,35*mm,35*mm], repeatRows=1)
+    rt.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#374151")),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("ALIGN",(1,1),(-1,-1),"CENTER"),
+        ("GRID",(0,0),(-1,-1),0.35,colors.HexColor("#c7c7c7")),("FONTSIZE",(0,0),(-1,-1),8),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#f6f7f8")])
+    ]))
+    story.append(rt)
+    story.append(PageBreak())
+
+    story.append(Paragraph("Detalle de predicciones",h2))
+    detail=[["Codigo","IA","Ventana","Lugar","Magnitud","Radio","Estado","Sismo CSN relacionado"]]
+    for pred,st,b,rad,cands in results:
+        timeband=""
+        if pred["daily_time_start"] and pred["daily_time_end"]:
+            timeband=f" {pred['daily_time_start']}-{pred['daily_time_end']}"
+        window=f"{pred['date_start']} a {pred['date_end']}{timeband}"
+        related="-"
+        if b:
+            e=b["e"]; when=parse_datetime(e["occurred_at"])
+            related=f"{when:%d/%m %H:%M} | M{e['magnitude']:.1f} | {b['dist']:.1f} km | {e['place']}"
+        detail.append([
+            Paragraph(_pdf_safe(pred["code"]),small), Paragraph(_pdf_safe(pred["group_name"]),small),
+            Paragraph(_pdf_safe(window),small), Paragraph(_pdf_safe(pred["place"]),small),
+            f"M{pred['mag_min']:.1f}-{pred['mag_max']:.1f}", f"{rad:.0f} km", st,
+            Paragraph(_pdf_safe(related),small)
+        ])
+    if len(detail)==1:
+        detail.append(["-","-","-","No hay predicciones para este filtro","-","-","-","-"])
+    dt=Table(detail, colWidths=[25*mm,22*mm,39*mm,55*mm,27*mm,20*mm,27*mm,67*mm], repeatRows=1)
+    dt.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#111827")),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("VALIGN",(0,0),(-1,-1),"TOP"),
+        ("GRID",(0,0),(-1,-1),0.3,colors.HexColor("#c7c7c7")),("FONTSIZE",(0,0),(-1,-1),7.3),
+        ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#f8f8f8")]),
+        ("TEXTCOLOR",(6,1),(6,-1),colors.HexColor("#111111"))
+    ]))
+    story.append(dt)
+
+    # Inspector section: one block per confirmed hit.
+    hits=[x for x in results if x[1]=="ACERTADA" and x[2]]
+    if hits:
+        story.append(PageBreak())
+        story.append(Paragraph("Inspector de coincidencias 3/3",h2))
+        inspect=[["Prediccion","Sismo CSN","Distancia","Magnitud","Tiempo","Ubicacion","Enlace"]]
+        for pred,st,b,rad,cands in hits:
+            e=b["e"]; when=parse_datetime(e["occurred_at"])
+            link=e["source_url"] or "-"
+            inspect.append([
+                pred["code"], Paragraph(_pdf_safe(f"{when:%d/%m/%Y %H:%M} - M{e['magnitude']:.1f} - {e['place']}"),small),
+                f"{b['dist']:.1f}/{rad:.0f} km", "OK", "OK", "OK", Paragraph(_pdf_safe(link),small)
+            ])
+        it=Table(inspect,colWidths=[30*mm,85*mm,35*mm,25*mm,25*mm,25*mm,60*mm],repeatRows=1)
+        it.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#065f46")),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("GRID",(0,0),(-1,-1),0.35,colors.HexColor("#b7b7b7")),("FONTSIZE",(0,0),(-1,-1),7.5)
+        ]))
+        story.append(it)
+
+    def footer(canvas,doc):
+        canvas.saveState(); canvas.setFont("Helvetica",7); canvas.setFillColor(colors.HexColor("#666666"))
+        canvas.drawString(12*mm,6*mm,"Sismologia Lab - evaluacion experimental basada en eventos CSN guardados")
+        canvas.drawRightString(landscape(A4)[0]-12*mm,6*mm,f"Pagina {doc.page}")
+        canvas.restoreState()
+    doc.build(story,onFirstPage=footer,onLaterPages=footer)
+    return {"predictions":len(ps),"hits":hit,"misses":miss,"pending":pending,"events":len(es)}
+
+@bot.tree.command(name="informe_pdf",description="Genera un PDF con resultados del experimento")
+@app_commands.describe(ia="IA/grupo a incluir, o TODAS")
+async def c_informe_pdf(i:discord.Interaction, ia:str="TODAS"):
+    await i.response.defer(thinking=True)
+    requested=(ia or "TODAS").strip()
+    group=None if requested.upper() in {"TODAS","TODO","ALL","*"} else requested.upper()
+    if group and not get_real_group(group):
+        await i.followup.send(f"❌ No encontré predicciones para `{group}`. Usa `TODAS` o un grupo importado.")
+        return
+    safe_name=re.sub(r"[^A-Za-z0-9_-]+","_",group or "TODAS")
+    path=Path(tempfile.gettempdir())/f"Sismologia_Lab_{safe_name}_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+    try:
+        stats=build_experiment_pdf(path,group)
+        msg=(f"📄 **Informe PDF generado** - {group or 'TODAS LAS IA'}\n"
+             f"🎯 {stats['predictions']} predicciones · ✅ {stats['hits']} aciertos · "
+             f"❌ {stats['misses']} fallos · 🟡 {stats['pending']} pendientes")
+        await i.followup.send(msg,file=discord.File(str(path),filename=path.name))
+    except Exception as exc:
+        print("Error generando informe PDF:",repr(exc))
+        await i.followup.send(f"❌ No pude generar el PDF: `{exc}`")
+    finally:
+        try: path.unlink(missing_ok=True)
+        except Exception: pass
+
 @bot.tree.command(name="backup",description="Crea ahora una copia de seguridad de SQLite")
 async def c_backup(i:discord.Interaction):
     try:
@@ -1298,6 +1472,136 @@ async def c_radio(i:discord.Interaction,magnitud:float,tipo_zona:str=""):
 
 
 
+
+# ---------- V1.5.3: CHAT IA GENERAL ----------
+
+_ai_history = defaultdict(lambda: deque(maxlen=max(2, AI_HISTORY_TURNS * 2)))
+
+def ai_project_snapshot():
+    """Contexto pequeño y de solo lectura para preguntas sobre este proyecto."""
+    try:
+        ps=get_real_group()
+        es=events()
+        hit=miss=pending=0
+        groups={}
+        for p in ps:
+            st,_,_,_=evaluate_real(p,es)
+            if st=="ACERTADA": hit+=1
+            elif st=="NO ACERTADA": miss+=1
+            else: pending+=1
+            groups.setdefault(p["group_name"],[0,0,0])
+            idx=0 if st=="ACERTADA" else (1 if st=="NO ACERTADA" else 2)
+            groups[p["group_name"]][idx]+=1
+        ranking="; ".join(f"{g}: {v[0]} aciertos, {v[1]} fallos, {v[2]} pendientes" for g,v in sorted(groups.items()))
+        recent=[]
+        for e in es[:5]:
+            recent.append(f"M{e['magnitude']:.1f} {e['place']} ({e['occurred_at']})")
+        return (
+            f"Proyecto sísmico actual: {len(ps)} predicciones; {hit} aciertos; "
+            f"{miss} no acertadas; {pending} pendientes. "
+            f"Por IA: {ranking or 'sin datos'}. "
+            f"Eventos CSN recientes guardados: {' | '.join(recent) if recent else 'sin datos'}."
+        )
+    except Exception as exc:
+        return f"El contexto del proyecto no pudo leerse en este momento: {type(exc).__name__}."
+
+def ai_system_prompt():
+    return (
+        "Eres el asistente general de un bot privado de Discord. Puedes conversar sobre temas generales, "
+        "explicar materias, ayudar con ideas, matemáticas y programación, y también responder sobre el "
+        "proyecto sísmico cuando el usuario lo pregunte. No inventes datos actuales del CSN. "
+        "Cuando uses el contexto sísmico incluido, aclara que son datos del proyecto. "
+        "Las estimaciones sísmicas del proyecto son experimentales y no constituyen predicciones científicamente validadas. "
+        "Responde en español salvo que el usuario pida otro idioma. Sé claro y relativamente breve."
+    )
+
+def call_ai_sync(user_id, question):
+    if not AI_API_KEY:
+        raise RuntimeError("AI_API_KEY no está configurada en Railway")
+    history=list(_ai_history[str(user_id)])
+    input_items=[{"role":"system","content":[{"type":"input_text","text":ai_system_prompt()+"\n\n"+ai_project_snapshot()}]}]
+    for role,text in history:
+        input_items.append({"role":role,"content":[{"type":"input_text","text":text}]})
+    input_items.append({"role":"user","content":[{"type":"input_text","text":question}]})
+    payload={
+        "model":AI_MODEL,
+        "input":input_items,
+        "max_output_tokens":AI_MAX_OUTPUT_TOKENS
+    }
+    r=requests.post(
+        AI_API_URL,
+        headers={"Authorization":f"Bearer {AI_API_KEY}","Content-Type":"application/json"},
+        json=payload,
+        timeout=75
+    )
+    if not r.ok:
+        detail=r.text[:500]
+        raise RuntimeError(f"API IA {r.status_code}: {detail}")
+    data=r.json()
+    answer=data.get("output_text")
+    if not answer:
+        parts=[]
+        for item in data.get("output",[]):
+            if item.get("type")=="message":
+                for c in item.get("content",[]):
+                    if c.get("type")=="output_text" and c.get("text"):
+                        parts.append(c["text"])
+        answer="\n".join(parts).strip()
+    if not answer:
+        raise RuntimeError("La API no devolvió texto")
+    _ai_history[str(user_id)].append(("user",question))
+    _ai_history[str(user_id)].append(("assistant",answer))
+    return answer
+
+async def send_ai_answer(interaction, question):
+    await interaction.response.defer(thinking=True)
+    try:
+        import asyncio
+        answer=await asyncio.to_thread(call_ai_sync, interaction.user.id, question)
+        # Discord messages cap at 2000 chars. Split cleanly.
+        chunks=[]
+        rest=answer.strip()
+        while rest:
+            if len(rest)<=1900:
+                chunks.append(rest); break
+            cut=rest.rfind("\n",0,1900)
+            if cut<900: cut=rest.rfind(" ",0,1900)
+            if cut<900: cut=1900
+            chunks.append(rest[:cut].strip())
+            rest=rest[cut:].strip()
+        await interaction.followup.send(chunks[0] if chunks else "No obtuve respuesta.")
+        for chunk in chunks[1:]:
+            await interaction.followup.send(chunk)
+    except Exception as exc:
+        await interaction.followup.send(
+            "❌ No pude usar el chat de IA.\n"
+            f"`{str(exc)[:700]}`\n\n"
+            "Comprueba `AI_API_KEY`, `AI_MODEL` y que Railway tenga acceso a Internet.",
+            ephemeral=True
+        )
+
+class AIChatModal(discord.ui.Modal, title="💬 Hablar con la IA"):
+    question=discord.ui.TextInput(
+        label="¿Qué quieres preguntarle?",
+        style=discord.TextStyle.paragraph,
+        placeholder="Puede ser de sismos, programación, ciencia, ideas... lo que quieras.",
+        min_length=1,
+        max_length=1500
+    )
+    async def on_submit(self, interaction):
+        await send_ai_answer(interaction, str(self.question))
+
+@bot.tree.command(name="chat",description="Habla con la IA del bot sobre temas generales")
+@app_commands.describe(pregunta="Tu pregunta para la IA")
+async def c_chat(i:discord.Interaction,pregunta:str):
+    await send_ai_answer(i,pregunta)
+
+@bot.tree.command(name="chat_nuevo",description="Borra el contexto reciente de tu conversación con la IA")
+async def c_chat_new(i:discord.Interaction):
+    _ai_history.pop(str(i.user.id),None)
+    await i.response.send_message("🧹 Conversación reciente de IA reiniciada.",ephemeral=True)
+
+
 # ---------- V1.2: INTERFAZ VISUAL ----------
 
 def ui_embed(title, description="", color=discord.Color.blurple()):
@@ -1383,6 +1687,7 @@ def build_help_embed():
     e.add_field(name="🧮 Calculadora",value="Desde `/panel` → **Calculadora**, o `/calcular`, `/distancia`, `/comparar`, `/radio`.",inline=False)
     e.add_field(name="📊 Resultados",value="`/ranking` · `/historial` · `/integridad`",inline=False)
     e.add_field(name="🔔 Alertas",value="`/canal_alertas` · `/estado_alertas` · `/desactivar_alertas`",inline=False)
+    e.add_field(name="💬 Chat IA",value="`/chat` para conversar de temas generales · `/chat_nuevo` para reiniciar el contexto.",inline=False)
     e.set_footer(text="Los botones del panel no modifican predicciones por sí solos.")
     return e
 
@@ -1734,6 +2039,16 @@ class MainPanel(discord.ui.View):
     async def help(self,interaction,button):
         await interaction.response.send_message(embed=build_help_embed(),ephemeral=True)
 
+    @discord.ui.button(label="Chat IA", emoji="💬", style=discord.ButtonStyle.success, row=2)
+    async def ai_chat(self,interaction,button):
+        if not AI_API_KEY:
+            await interaction.response.send_message(
+                "⚠️ El chat IA todavía no tiene una clave configurada. Añade `AI_API_KEY` en Railway.",
+                ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(AIChatModal())
+
 @bot.tree.command(name="panel",description="Abre el centro de control visual del Bot Sísmico")
 async def c_panel(i:discord.Interaction):
     ps=get_real_group()
@@ -1751,7 +2066,7 @@ async def c_panel(i:discord.Interaction):
     e.add_field(name="📑 Correlaciones",value=f"**{n_corr}**",inline=True)
     e.add_field(name="🔔 Alertas",value=("Configuradas" if channel_id else "Sin canal"),inline=True)
     e.add_field(name="📡 Monitor",value=f"Cada **{CHECK_MINUTES} min**",inline=True)
-    e.set_footer(text="Panel v1.3 • Los submenús duran 15 minutos")
+    e.set_footer(text="Panel v1.5.3 • Chat IA + Sismologia Lab")
     await i.response.send_message(embed=e,view=MainPanel())
 
 @bot.tree.command(name="ayuda",description="Muestra una guía limpia de los comandos del bot")
