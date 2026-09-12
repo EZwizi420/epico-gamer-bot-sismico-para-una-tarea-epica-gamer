@@ -66,6 +66,10 @@ def init_db():
           sent_at TEXT NOT NULL,
           PRIMARY KEY(event_source_id, prediction_code)
         );
+        CREATE TABLE IF NOT EXISTS csn_feed_sent(
+          event_source_id TEXT PRIMARY KEY,
+          sent_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS prediction_snapshots(
           code TEXT PRIMARY KEY,
           group_name TEXT NOT NULL,
@@ -477,6 +481,65 @@ def event_matches_real_prediction(e, p):
         "radius": rad,
     }
 
+
+def csn_feed_was_sent(event_id):
+    with connect() as con:
+        return con.execute(
+            "SELECT 1 FROM csn_feed_sent WHERE event_source_id=?",
+            (str(event_id),)
+        ).fetchone() is not None
+
+def mark_csn_feed_sent(event_id):
+    with connect() as con:
+        con.execute(
+            "INSERT OR IGNORE INTO csn_feed_sent(event_source_id,sent_at) VALUES(?,?)",
+            (str(event_id), datetime.now().isoformat())
+        )
+
+async def send_csn_feed_for_new_events(new_events):
+    """Publica TODOS los sismos nuevos del CSN en un canal independiente."""
+    channel_id=get_setting("csn_feed_channel_id")
+    if not channel_id or not new_events:
+        return 0
+    try:
+        channel=bot.get_channel(int(channel_id)) or await bot.fetch_channel(int(channel_id))
+    except Exception as exc:
+        print("No pude abrir el canal feed CSN:",exc)
+        return 0
+
+    sent=0
+    for e in sorted(new_events, key=lambda x: parse_datetime(x["occurred_at"])):
+        if csn_feed_was_sent(e["source_id"]):
+            continue
+        when=parse_datetime(e["occurred_at"])
+        embed=discord.Embed(
+            title=f"🌎 Nuevo sismo CSN · M{e['magnitude']:.1f}",
+            description=e["place"] or "Sin referencia geográfica",
+            color=discord.Color.blurple()
+        )
+        embed.add_field(name="📅 Fecha",value=f"{when:%d/%m/%Y}",inline=True)
+        embed.add_field(name="🕒 Hora local",value=f"{when:%H:%M:%S}",inline=True)
+        embed.add_field(name="📈 Magnitud",value=f"M{e['magnitude']:.1f}",inline=True)
+        embed.add_field(name="🌐 Coordenadas",value=f"{e['latitude']:.4f}, {e['longitude']:.4f}",inline=True)
+        embed.add_field(
+            name="⬇️ Profundidad",
+            value=(f"{e['depth_km']:.1f} km" if e["depth_km"] is not None else "Sin dato"),
+            inline=True
+        )
+        if e["source_url"]:
+            embed.add_field(name="🔗 Informe oficial",value=f"[Abrir en CSN]({e['source_url']})",inline=False)
+        embed.set_footer(text=f"CSN ID: {e['source_id']} · Feed automático, sin @everyone")
+        try:
+            await channel.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            mark_csn_feed_sent(e["source_id"])
+            sent+=1
+        except Exception as exc:
+            print("Error enviando sismo al feed CSN:",exc)
+    return sent
+
 async def send_alerts_for_new_events(new_events):
     channel_id=get_setting("alert_channel_id")
     if not channel_id or not new_events:
@@ -568,7 +631,10 @@ async def csn_loop():
 
         if newly_saved:
             print(f"CSN: {len(newly_saved)} eventos nuevos ({len(fetched)} leídos)")
-            await send_alerts_for_new_events(newly_saved)
+            feed_sent=await send_csn_feed_for_new_events(newly_saved)
+            alerts_sent=await send_alerts_for_new_events(newly_saved)
+            if feed_sent or alerts_sent:
+                print(f"Discord: feed CSN={feed_sent}, alertas correlación={alerts_sent}")
 
         if errs:
             print("CSN avisos:",errs[:3])
@@ -926,6 +992,36 @@ async def c_ver_real(i:discord.Interaction,codigo:str):
     await i.response.send_message(text[:1950])
 
 
+
+
+@bot.tree.command(name="canal_sismos",description="Usa este canal para publicar TODOS los sismos nuevos del CSN")
+async def c_csn_feed_channel(i:discord.Interaction):
+    set_setting("csn_feed_channel_id", i.channel_id)
+    await i.response.send_message(
+        f"🌎 Feed CSN activado en <#{i.channel_id}>.\n"
+        f"Publicaré aquí **todos los sismos nuevos detectados por el monitor** cada {CHECK_MINUTES} minutos.\n"
+        "Este feed no usa `@everyone`; las correlaciones importantes siguen yendo al canal de alertas."
+    )
+
+@bot.tree.command(name="estado_canal_sismos",description="Muestra dónde está configurado el feed de todos los sismos CSN")
+async def c_csn_feed_state(i:discord.Interaction):
+    channel_id=get_setting("csn_feed_channel_id")
+    if channel_id:
+        await i.response.send_message(
+            f"🌎 Canal de todos los sismos: <#{channel_id}>\n"
+            f"📡 Consulta CSN: cada **{CHECK_MINUTES} minutos**.\n"
+            "🔕 Sin `@everyone`."
+        )
+    else:
+        await i.response.send_message(
+            "🌎 No hay canal de feed CSN configurado. Ejecuta `/canal_sismos` dentro del canal que quieras usar."
+        )
+
+@bot.tree.command(name="desactivar_canal_sismos",description="Desactiva el feed de todos los sismos del CSN")
+async def c_csn_feed_off(i:discord.Interaction):
+    with connect() as con:
+        con.execute("DELETE FROM bot_settings WHERE key='csn_feed_channel_id'")
+    await i.response.send_message("🔕 Feed de todos los sismos CSN desactivado.")
 
 @bot.tree.command(name="canal_alertas",description="Usa este canal para las alertas automáticas de correlaciones")
 async def c_alert_channel(i:discord.Interaction):
