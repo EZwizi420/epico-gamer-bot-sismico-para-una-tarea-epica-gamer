@@ -248,6 +248,21 @@ def parse_real_date_window(raw, year_default=2026):
     def check(a,b,t1=None,t2=None):
         if b < a: raise ValueError("rango de fechas invertido")
         return a,b,t1,t2
+    # Dos fechas completas con horas y guion (MISTRAL AI).
+    # Se comprueba ANTES de la fecha individual para no truncar la ventana.
+    m = re.search(
+        r"(\d{1,2})/(\d{1,2})/(20\d{2})\s+(\d{1,2}:\d{2})\s*-\s*"
+        r"(\d{1,2})/(\d{1,2})/(20\d{2})\s+(\d{1,2}:\d{2})",
+        s,
+    )
+    if m:
+        d1,mo1,y1,t1,d2,mo2,y2,t2 = m.groups()
+        start_date, end_date = make(d1,mo1,y1), make(d2,mo2,y2)
+        start_dt = datetime.combine(start_date, datetime.strptime(t1, "%H:%M").time())
+        end_dt = datetime.combine(end_date, datetime.strptime(t2, "%H:%M").time())
+        if end_dt < start_dt:
+            raise ValueError("rango de fecha/hora invertido")
+        return check(start_date, end_date, t1, t2)
     # Explicit start/end dates, each with its own clock time (META AI).
     m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(20\d{2}))?\s+(\d{1,2}:\d{2})\s+a\s+(\d{1,2})/(\d{1,2})(?:/(20\d{2}))?\s+(\d{1,2}:\d{2})",s)
     if m:
