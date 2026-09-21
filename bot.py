@@ -19,7 +19,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 
 from csn import fetch_recent_events, fetch_recent_events_debug, fetch_historical_events
 from dashboard import run_dashboard
-from evaluator import evaluate_real as shared_evaluate_real, best_proximity
+from evaluator import evaluate_real as shared_evaluate_real, best_proximity, real_window_finished as shared_real_window_finished, real_time_ok as shared_real_time_ok, _window_bounds as shared_window_bounds
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 EXCEL_PATH = os.getenv("EXCEL_PATH", "Proyecto_Tabla_de_datos_con_coordenadas.xlsx")
@@ -345,27 +345,16 @@ def import_real_group(group_name):
     return imported, skipped, errors
 
 def _window_bounds(p):
-    """Inclusive local wall-clock interval; no repeating daily time bands."""
-    start=datetime.combine(date.fromisoformat(p["date_start"]),time.min)
-    end=datetime.combine(date.fromisoformat(p["date_end"]),time.max)
-    if p["daily_time_start"]:
-        start=datetime.combine(start.date(),datetime.strptime(p["daily_time_start"],"%H:%M").time())
-    if p["daily_time_end"]:
-        end=datetime.combine(end.date(),datetime.strptime(p["daily_time_end"],"%H:%M").time())
-    return start,end
+    return shared_window_bounds(p)
 
-def real_time_ok(event_dt,p):
-    start,end=_window_bounds(p)
-    return start <= event_dt.replace(tzinfo=None) <= end
+def real_time_ok(event_dt, p):
+    return shared_real_time_ok(event_dt, p)
 
 def real_window_finished(p):
-    return datetime.now(ZoneInfo("America/Santiago")).replace(tzinfo=None)>_window_bounds(p)[1]
+    return shared_real_window_finished(p)
 
-def prediction_alert_active(p,now=None):
-    now=now or datetime.now(ZoneInfo("America/Santiago"))
-    if now.tzinfo is None: now=now.replace(tzinfo=ZoneInfo("America/Santiago"))
-    return now.astimezone(ZoneInfo("America/Santiago")).replace(tzinfo=None)<=_window_bounds(p)[1]
-
+def prediction_alert_active(p, now=None):
+    return not shared_real_window_finished(p, now)
 
 def evaluate_real(p, es):
     # Fuente única de verdad compartida con el dashboard web.
@@ -445,6 +434,170 @@ def backup_database():
         except: pass
     return out
 
+
+# ---------- RETENCIÓN SEGURA DE EVENTOS (v1.7.0) ----------
+# Conservador: se conservan TODOS los eventos dentro de cualquier ventana de
+# predicción, además de eventos con proximidad espacial y de magnitud.
+# Los registros de alertas/historial no se eliminan nunca aquí.
+EVENT_RETENTION_DAYS = 3
+
+def storage_report():
+    src = Path(DB_PATH)
+    backup_dir = src.parent / "backups"
+    backups = sorted(backup_dir.glob("bot_sismico_*.db")) if backup_dir.is_dir() else []
+    db_files = [src, Path(str(src)+"-wal"), Path(str(src)+"-shm")]
+    return {"db_bytes": sum(f.stat().st_size for f in db_files if f.is_file()),
+            "backup_bytes": sum(f.stat().st_size for f in backups),
+            "backup_count": len(backups),
+            "backup_dir": str(backup_dir)}
+
+def cleanup_unrelated_events(dry_run=False, now=None):
+    from evaluator import chile_local, radius as evaluation_radius, haversine as evaluation_haversine, _window_bounds
+    now = chile_local(now or datetime.now(ZoneInfo("America/Santiago")))
+    cutoff = now - timedelta(days=EVENT_RETENTION_DAYS)
+    before = storage_report()
+    # Never delete before checking backup inventory and a readable backup.
+    if not dry_run:
+        backup_dir = Path(before["backup_dir"])
+        backups = sorted(backup_dir.glob("bot_sismico_*.db"), key=lambda f:f.stat().st_mtime, reverse=True) if backup_dir.is_dir() else []
+        if not backups:
+            raise RuntimeError("Limpieza omitida: no hay backups SQLite. Crea uno con /backup antes de activar la limpieza.")
+        try:
+            with sqlite3.connect(f"file:{backups[0]}?mode=ro", uri=True) as bcon:
+                integrity = bcon.execute("PRAGMA quick_check").fetchone()[0]
+            if integrity != "ok": raise RuntimeError("Backup SQLite no supera quick_check")
+        except Exception as exc:
+            raise RuntimeError(f"Limpieza omitida: backup más reciente ilegible: {exc}") from exc
+    with connect() as con:
+        con.execute("PRAGMA busy_timeout=10000")
+        ps = con.execute("SELECT * FROM real_predictions").fetchall()
+        # Include legacy test predictions: their evaluation window is +/- 2h.
+        tests = con.execute("SELECT * FROM predictions").fetchall()
+        # A missing or invalid prediction must NOT trigger irreversible deletion.
+        windows = [(p, *_window_bounds(p)) for p in ps]
+        test_windows = [(p, datetime.fromisoformat(p['predicted_at'])-timedelta(hours=DEFAULT_MARGIN_HOURS),
+                            datetime.fromisoformat(p['predicted_at'])+timedelta(hours=DEFAULT_MARGIN_HOURS)) for p in tests]
+        old = con.execute("SELECT source_id,occurred_at,latitude,longitude,magnitude FROM observed_events WHERE source='CSN' AND occurred_at < ?", (cutoff.date().isoformat(),)).fetchall()
+        delete_ids=[]; kept=0
+        for e in old:
+            event_dt=chile_local(e['occurred_at'])
+            # Keep anything in a prediction window even if its magnitude/location differ.
+            relevant=any(start <= event_dt <= end for _,start,end in windows+test_windows)
+            if not relevant:
+                for pred,start,end in windows:
+                    # Candidate: within 48h of the window AND within 2x spatial
+                    # radius AND within 1 magnitude unit of its declared range.
+                    if event_dt < start-timedelta(hours=48) or event_dt > end+timedelta(hours=48):continue
+                    rad=evaluation_radius((pred['mag_min']+pred['mag_max'])/2,pred['zone_type'])
+                    if (evaluation_haversine(pred['latitude'],pred['longitude'],e['latitude'],e['longitude']) <= 2*rad
+                        and pred['mag_min']-1 <= e['magnitude'] <= pred['mag_max']+1):
+                        relevant=True;break
+            if not relevant:
+                for pred,start,end in test_windows:
+                    if not start-timedelta(hours=48) <= event_dt <= end+timedelta(hours=48):continue
+                    if (evaluation_haversine(pred['latitude'],pred['longitude'],e['latitude'],e['longitude']) <= 2*evaluation_radius(pred['magnitude'],pred['zone_type'])
+                        and abs(e['magnitude']-pred['magnitude']) <= pred['mag_margin']+1):
+                        relevant=True;break
+            # Preserve every referenced event, even if no prediction remains.
+            if not relevant:
+                relevant=any(con.execute('SELECT 1 FROM '+table+' WHERE event_source_id=? LIMIT 1',(e['source_id'],)).fetchone()
+                             for table in ('sent_alerts','correlation_history'))
+            if relevant:kept+=1
+            else:delete_ids.append(e['source_id'])
+        if not dry_run and delete_ids:
+            con.executemany("DELETE FROM observed_events WHERE source='CSN' AND source_id=?",((sid,) for sid in delete_ids))
+    after=storage_report()
+    return {"examined":len(old),"kept":kept,"deleted":0 if dry_run else len(delete_ids),
+            "eligible":len(delete_ids),"dry_run":dry_run,"before":before,"after":after}
+
+# ---------- LIMPIEZA MANUAL CON CONFIRMACIÓN ----------
+# Vista previa no modifica la base. Solo el usuario que inició la vista
+# puede confirmar la eliminación; se exige permiso de administración.
+def _human_bytes(value):
+    return f"{value / (1024 * 1024):.2f} MiB"
+
+
+def _cleanup_summary(result):
+    before=result["before"]
+    return (f"Sismos antiguos examinados: **{result['examined']}**\n"
+            f"Protegidos entre los examinados: **{result['kept']}**\n"
+            f"Elegibles para borrar: **{result['eligible']}**\n"
+            f"Base (+ WAL/SHM): **{_human_bytes(before['db_bytes'])}**\n"
+            f"Backups: **{before['backup_count']}** · **{_human_bytes(before['backup_bytes'])}**\n"
+            "No se eliminan backups ni se compacta SQLite.")
+
+
+class ConfirmCleanup(discord.ui.View):
+    def __init__(self, owner_id, expected_ids):
+        super().__init__(timeout=120)
+        self.owner_id=owner_id
+        self.expected_ids=expected_ids
+        self.done=False
+
+    async def interaction_check(self, interaction:discord.Interaction):
+        if interaction.user.id != self.owner_id or not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("Solo quien inició esta vista previa y tiene permiso de administrador puede confirmarla.",ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Confirmar limpieza",style=discord.ButtonStyle.danger)
+    async def confirm(self,interaction:discord.Interaction,button:discord.ui.Button):
+        if self.done:
+            await interaction.response.send_message("Esta confirmación ya fue utilizada.",ephemeral=True)
+            return
+        self.done=True
+        self.stop()
+        for child in self.children:child.disabled=True
+        await interaction.response.edit_message(view=self)
+        try:
+            # Recheck the candidates and backup before deletion. If the automatic
+            # cleanup changed the preview, require a fresh confirmation.
+            preview=await __import__('asyncio').to_thread(cleanup_unrelated_events,True)
+            if preview['eligible'] != self.expected_ids:
+                await interaction.followup.send("Los datos cambiaron desde la vista previa. Ejecuta `/limpiar_sismos` otra vez para confirmar los nuevos valores.",ephemeral=True)
+                return
+            result=await __import__('asyncio').to_thread(cleanup_unrelated_events,False)
+            await interaction.followup.send(f"✅ Limpieza finalizada: **{result['deleted']}** sismos eliminados.\n"+_cleanup_summary(result),ephemeral=True)
+        except Exception as exc:
+            await interaction.followup.send(f"❌ Limpieza cancelada o fallida: `{type(exc).__name__}: {str(exc)[:350]}`",ephemeral=True)
+
+    @discord.ui.button(label="Cancelar",style=discord.ButtonStyle.secondary)
+    async def cancel(self,interaction:discord.Interaction,button:discord.ui.Button):
+        self.done=True
+        self.stop()
+        for child in self.children:child.disabled=True
+        await interaction.response.edit_message(content="Limpieza cancelada. No se borró nada mediante este comando.",view=self)
+
+
+@bot.tree.command(name="limpiar_sismos",description="Vista previa y confirmación para limpiar sismos no relacionados de más de 3 días")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def c_limpiar_sismos(i:discord.Interaction):
+    if not i.user.guild_permissions.administrator:
+        await i.response.send_message("❌ Solo administradores pueden ejecutar este comando.",ephemeral=True)
+        return
+    await i.response.defer(ephemeral=True)
+    try:
+        preview=await __import__('asyncio').to_thread(cleanup_unrelated_events,True)
+        if not preview['eligible']:
+            await i.followup.send("🧹 No hay sismos elegibles para borrar.\n"+_cleanup_summary(preview),ephemeral=True)
+            return
+        await i.followup.send("🧹 **Vista previa (no se ha borrado nada)**\n"+_cleanup_summary(preview)+"\n¿Confirmas la eliminación? (120 segundos)",view=ConfirmCleanup(i.user.id,preview['eligible']),ephemeral=True)
+    except Exception as exc:
+        await i.followup.send(f"❌ No se pudo preparar la limpieza: `{type(exc).__name__}: {str(exc)[:350]}`",ephemeral=True)
+
+
+@tasks.loop(hours=24)
+async def cleanup_loop():
+    try:
+        result=await __import__('asyncio').to_thread(cleanup_unrelated_events)
+        print('Limpieza CSN:',result)
+    except Exception as exc:
+        print('Error limpieza CSN (sin borrar):',type(exc).__name__,str(exc))
+
+@cleanup_loop.before_loop
+async def before_cleanup():
+    await bot.wait_until_ready()
 
 # ---------- ALERTAS AUTOMÁTICAS ----------
 
@@ -666,6 +819,7 @@ async def on_ready():
     await bot.tree.sync()
     if not csn_loop.is_running():csn_loop.start()
     if not backup_loop.is_running():backup_loop.start()
+    if not cleanup_loop.is_running():cleanup_loop.start()
     freeze_predictions()
     print(f"Conectado: {bot.user}. CSN cada {CHECK_MINUTES} min. Backup diario activo.")
 
@@ -2005,7 +2159,7 @@ async def c_score(i:discord.Interaction,codigo:str):
         emb.add_field(name="📈 Magnitud · 30%",value=f"**{sc['magnitude_pct']:.1f}%**\nReal: M{float(e['magnitude']):.1f} · Pred.: {float(p['mag_min']):.1f}–{float(p['mag_max']):.1f}",inline=True)
         emb.add_field(name="⏱️ Tiempo · 30%",value=f"**{sc['temporal_pct']:.1f}%**\nEvento: {dt:%d/%m/%Y %H:%M:%S}",inline=True)
         emb.add_field(name="🌎 Sismo más próximo al criterio",value=e["place"],inline=False)
-        emb.set_footer(text="Score descriptivo; no modifica el criterio oficial 3/3.")
+        emb.set_footer(text="Score descriptivo; no modifica el criterio oficial 3/3. Evento 3/3 priorizado cuando existe.")
         await i.followup.send(embed=emb)
     
     except Exception as exc:
