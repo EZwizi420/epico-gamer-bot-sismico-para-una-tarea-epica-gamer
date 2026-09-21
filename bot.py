@@ -467,7 +467,15 @@ def storage_report():
             "backup_dir": str(backup_dir)}
 
 def cleanup_unrelated_events(dry_run=False, now=None):
-    from evaluator import chile_local, radius as evaluation_radius, haversine as evaluation_haversine, _window_bounds
+    from evaluator import radius as evaluation_radius, haversine as evaluation_haversine, _window_bounds
+    # El evaluator.py instalado no exporta chile_local. Los tiempos CSN
+    # se guardan en horario de Chile; normalizamos a datetime local naive
+    # para compararlos con las ventanas naive de _window_bounds.
+    def chile_local(value):
+        dt = datetime.fromisoformat(value) if isinstance(value, str) else value
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(ZoneInfo("America/Santiago")).replace(tzinfo=None)
+        return dt
     now = chile_local(now or datetime.now(ZoneInfo("America/Santiago")))
     cutoff = now - timedelta(days=EVENT_RETENTION_DAYS)
     before = storage_report()
