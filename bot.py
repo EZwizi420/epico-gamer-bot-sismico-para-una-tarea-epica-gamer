@@ -569,24 +569,6 @@ class ConfirmCleanup(discord.ui.View):
         await interaction.response.edit_message(content="Limpieza cancelada. No se borró nada mediante este comando.",view=self)
 
 
-@bot.tree.command(name="limpiar_sismos",description="Vista previa y confirmación para limpiar sismos no relacionados de más de 3 días")
-@app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)
-async def c_limpiar_sismos(i:discord.Interaction):
-    if not i.user.guild_permissions.administrator:
-        await i.response.send_message("❌ Solo administradores pueden ejecutar este comando.",ephemeral=True)
-        return
-    await i.response.defer(ephemeral=True)
-    try:
-        preview=await __import__('asyncio').to_thread(cleanup_unrelated_events,True)
-        if not preview['eligible']:
-            await i.followup.send("🧹 No hay sismos elegibles para borrar.\n"+_cleanup_summary(preview),ephemeral=True)
-            return
-        await i.followup.send("🧹 **Vista previa (no se ha borrado nada)**\n"+_cleanup_summary(preview)+"\n¿Confirmas la eliminación? (120 segundos)",view=ConfirmCleanup(i.user.id,preview['eligible']),ephemeral=True)
-    except Exception as exc:
-        await i.followup.send(f"❌ No se pudo preparar la limpieza: `{type(exc).__name__}: {str(exc)[:350]}`",ephemeral=True)
-
-
 @tasks.loop(hours=24)
 async def cleanup_loop():
     try:
@@ -780,6 +762,25 @@ async def send_alerts_for_new_events(new_events):
 
 intents=discord.Intents.default()
 bot=commands.Bot(command_prefix="!",intents=intents)
+
+@bot.tree.command(name="limpiar_sismos",description="Vista previa y confirmación para limpiar sismos no relacionados de más de 3 días")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)
+async def c_limpiar_sismos(i:discord.Interaction):
+    if not i.user.guild_permissions.administrator:
+        await i.response.send_message("❌ Solo administradores pueden ejecutar este comando.",ephemeral=True)
+        return
+    await i.response.defer(ephemeral=True)
+    try:
+        preview=await __import__('asyncio').to_thread(cleanup_unrelated_events,True)
+        if not preview['eligible']:
+            await i.followup.send("🧹 No hay sismos elegibles para borrar.\n"+_cleanup_summary(preview),ephemeral=True)
+            return
+        await i.followup.send("🧹 **Vista previa (no se ha borrado nada)**\n"+_cleanup_summary(preview)+"\n¿Confirmas la eliminación? (120 segundos)",view=ConfirmCleanup(i.user.id,preview['eligible']),ephemeral=True)
+    except Exception as exc:
+        await i.followup.send(f"❌ No se pudo preparar la limpieza: `{type(exc).__name__}: {str(exc)[:350]}`",ephemeral=True)
+
+
 
 @tasks.loop(minutes=CHECK_MINUTES)
 async def csn_loop():
