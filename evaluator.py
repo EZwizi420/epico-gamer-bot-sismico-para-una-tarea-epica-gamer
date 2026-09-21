@@ -24,22 +24,23 @@ def radius(mag,zone=""):
     if "macro" in z or "región amplia" in z:r=max(r,100)
     return r
 
+def _window_bounds(p):
+    start=datetime.combine(date.fromisoformat(p["date_start"]),time.min)
+    end=datetime.combine(date.fromisoformat(p["date_end"]),time.max)
+    if p["daily_time_start"]:
+        start=datetime.combine(start.date(),datetime.strptime(p["daily_time_start"],"%H:%M").time())
+    if p["daily_time_end"]:
+        end=datetime.combine(end.date(),datetime.strptime(p["daily_time_end"],"%H:%M").time())
+    return start,end
+
 def real_time_ok(event_dt,p):
-    d1=date.fromisoformat(p["date_start"]); d2=date.fromisoformat(p["date_end"])
-    if not (d1<=event_dt.date()<=d2): return False
-    t1s,t2s=p["daily_time_start"],p["daily_time_end"]
-    if not t1s or not t2s:return True
-    t1=datetime.strptime(t1s,"%H:%M").time(); t2=datetime.strptime(t2s,"%H:%M").time(); et=event_dt.time()
-    if t2==time(0,0):return et>=t1
-    if t1<=t2:return t1<=et<=t2
-    return et>=t1 or et<=t2
+    start,end=_window_bounds(p)
+    return start <= event_dt.replace(tzinfo=None) <= end
 
 def real_window_finished(p,now=None):
-    now=now or datetime.now(); d2=date.fromisoformat(p["date_end"]); t2s=p["daily_time_end"]
-    if t2s:
-        t2=datetime.strptime(t2s,"%H:%M").time(); end_dt=datetime.combine(d2,time(23,59,59) if t2==time(0,0) else t2)
-    else:end_dt=datetime.combine(d2,time(23,59,59))
-    return now>end_dt
+    now=now or datetime.now()
+    return now.replace(tzinfo=None)>_window_bounds(p)[1]
+
 
 def evaluate_real(p,es,now=None):
     rad=radius((p["mag_min"]+p["mag_max"])/2,p["zone_type"]); matches=[]; candidates=[]

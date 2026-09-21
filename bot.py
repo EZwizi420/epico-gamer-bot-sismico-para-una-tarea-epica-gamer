@@ -3,6 +3,7 @@ import os, re, math, sqlite3, hashlib, threading, tempfile, resource
 import time as pytime
 from datetime import datetime, date, time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import discord
 import requests
@@ -231,42 +232,51 @@ def parse_mag_range(raw):
     return min(nums[0], nums[1]), max(nums[0], nums[1])
 
 def parse_real_date_window(raw, year_default=2026):
-    """Interpreta formatos existentes en el Excel real.
+    """Return dates and optional absolute start/end times (Chile local).
 
-    Retorna date_start, date_end, daily_time_start, daily_time_end.
-    Las horas, si existen, son bandas diarias dentro del rango de fechas.
+    A single timestamp is a point, not an invented multi-hour window.
+    UTC timestamps are converted using the timezone for the event date.
     """
-    s = str(raw or "").strip().lower()
-    if not s:
-        raise ValueError("fecha vacía")
-
-    # Hora opcional: 00:00-06:00, 18:00-00:00, etc.
-    tm = re.search(r"(\d{1,2}:\d{2})\s*[-–]\s*(\d{1,2}:\d{2})", s)
-    t_start = tm.group(1) if tm else None
-    t_end = tm.group(2) if tm else None
-
-    # Formato 10 - 13/09/2026
-    m = re.search(r"(\d{1,2})\s*[-–]\s*(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(20\d{2})", s)
+    from datetime import timezone
+    if isinstance(raw, datetime):
+        raw = raw.strftime("%d/%m/%Y %H:%M")
+    if isinstance(raw, date):
+        return raw, raw, None, None
+    s = str(raw or "").strip().lower().replace("–", "-").replace("—", "-")
+    if not s: raise ValueError("fecha vacía")
+    def make(d, m, y=None): return date(int(y or year_default), int(m), int(d))
+    def check(a,b,t1=None,t2=None):
+        if b < a: raise ValueError("rango de fechas invertido")
+        return a,b,t1,t2
+    # Explicit start/end dates, each with its own clock time (META AI).
+    m = re.search(r"(\d{1,2})/(\d{1,2})(?:/(20\d{2}))?\s+(\d{1,2}:\d{2})\s+a\s+(\d{1,2})/(\d{1,2})(?:/(20\d{2}))?\s+(\d{1,2}:\d{2})",s)
     if m:
-        d1,d2,mo,yr = map(int,m.groups())
-        return date(yr,mo,d1), date(yr,mo,d2), t_start, t_end
-
-    # Formato 10-13 de septiembre / 11-13 septiembre / 11-13 sept
-    m = re.search(r"(\d{1,2})\s*[-–]\s*(\d{1,2})(?:\s+de)?\s+([a-záéíóú]+)", s)
+        d1,mo1,y1,t1,d2,mo2,y2,t2=m.groups()
+        return check(make(d1,mo1,y1),make(d2,mo2,y2),t1,t2)
+    # One full date with UTC time and stated duration (GEMINI).
+    m=re.search(r"(\d{1,2})/(\d{1,2})/(20\d{2})\s+(\d{1,2}:\d{2})\s+utc\s*\(\s*(\d+)\s*h\s*\)",s)
     if m:
-        d1,d2,mon = m.groups()
-        mo = MONTHS_ES.get(mon)
-        if not mo:
-            raise ValueError(f"mes no reconocido: {mon}")
-        return date(year_default,mo,int(d1)), date(year_default,mo,int(d2)), t_start, t_end
-
-    # Formato explícito DD/MM/YYYY - DD/MM/YYYY si se agrega después.
-    dates = re.findall(r"(\d{1,2})/(\d{1,2})/(20\d{2})", s)
-    if len(dates) >= 2:
-        a,b = dates[0],dates[1]
-        return date(int(a[2]),int(a[1]),int(a[0])), date(int(b[2]),int(b[1]),int(b[0])), t_start,t_end
-
+        d,mo,y,clock,hours=m.groups()
+        start=datetime.combine(make(d,mo,y),datetime.strptime(clock,"%H:%M").time(),tzinfo=timezone.utc).astimezone(ZoneInfo("America/Santiago"))
+        end=(datetime.combine(make(d,mo,y),datetime.strptime(clock,"%H:%M").time(),tzinfo=timezone.utc)+timedelta(hours=int(hours))).astimezone(ZoneInfo("America/Santiago"))
+        return check(start.date(),end.date(),start.strftime("%H:%M"),end.strftime("%H:%M"))
+    # 23-24/09/2026; 10 - 13/09/2026.
+    m=re.search(r"(\d{1,2})\s*-\s*(\d{1,2})\s*/\s*(\d{1,2})\s*/\s*(20\d{2})",s)
+    if m:
+        d1,d2,mo,y=m.groups();return check(make(d1,mo,y),make(d2,mo,y))
+    # Full date and optional time or clock interval (PERPLEXITY / MISTRAL).
+    m=re.search(r"(\d{1,2})/(\d{1,2})/(20\d{2})(?:\s*,?\s*(\d{1,2}:\d{2})(?:\s*-\s*(\d{1,2}:\d{2}))?)?",s)
+    if m:
+        d,mo,y,t1,t2=m.groups(); day=make(d,mo,y)
+        return check(day,day,t1,t2 or t1)
+    # 11-13 de septiembre / 21-24 de septiembre de 2026.
+    m=re.search(r"(\d{1,2})\s*-\s*(\d{1,2})(?:\s+de)?\s+([a-záéíóú]+)(?:\s+de\s+(20\d{2}))?",s)
+    if m:
+        d1,d2,mon,y=m.groups();mo=MONTHS_ES.get(mon)
+        if not mo:raise ValueError(f"mes no reconocido: {mon}")
+        return check(make(d1,mo,y),make(d2,mo,y))
     raise ValueError(f"rango de fecha no reconocido: {raw}")
+
 
 def import_real_group(group_name):
     group_name = group_name.strip().upper()
@@ -334,40 +344,28 @@ def import_real_group(group_name):
     freeze_predictions()
     return imported, skipped, errors
 
-def real_time_ok(event_dt, p):
-    d1 = date.fromisoformat(p["date_start"])
-    d2 = date.fromisoformat(p["date_end"])
-    if not (d1 <= event_dt.date() <= d2):
-        return False
+def _window_bounds(p):
+    """Inclusive local wall-clock interval; no repeating daily time bands."""
+    start=datetime.combine(date.fromisoformat(p["date_start"]),time.min)
+    end=datetime.combine(date.fromisoformat(p["date_end"]),time.max)
+    if p["daily_time_start"]:
+        start=datetime.combine(start.date(),datetime.strptime(p["daily_time_start"],"%H:%M").time())
+    if p["daily_time_end"]:
+        end=datetime.combine(end.date(),datetime.strptime(p["daily_time_end"],"%H:%M").time())
+    return start,end
 
-    t1s, t2s = p["daily_time_start"], p["daily_time_end"]
-    if not t1s or not t2s:
-        return True
-
-    t1 = datetime.strptime(t1s,"%H:%M").time()
-    t2 = datetime.strptime(t2s,"%H:%M").time()
-    et = event_dt.time()
-
-    # 18:00-00:00 se interpreta hasta fin del día.
-    if t2 == time(0,0):
-        return et >= t1
-    if t1 <= t2:
-        return t1 <= et <= t2
-    # Soporta bandas que crucen medianoche.
-    return et >= t1 or et <= t2
+def real_time_ok(event_dt,p):
+    start,end=_window_bounds(p)
+    return start <= event_dt.replace(tzinfo=None) <= end
 
 def real_window_finished(p):
-    d2 = date.fromisoformat(p["date_end"])
-    t2s = p["daily_time_end"]
-    if t2s:
-        t2 = datetime.strptime(t2s,"%H:%M").time()
-        if t2 == time(0,0):
-            end_dt = datetime.combine(d2, time(23,59,59))
-        else:
-            end_dt = datetime.combine(d2,t2)
-    else:
-        end_dt = datetime.combine(d2,time(23,59,59))
-    return datetime.now() > end_dt
+    return datetime.now(ZoneInfo("America/Santiago")).replace(tzinfo=None)>_window_bounds(p)[1]
+
+def prediction_alert_active(p,now=None):
+    now=now or datetime.now(ZoneInfo("America/Santiago"))
+    if now.tzinfo is None: now=now.replace(tzinfo=ZoneInfo("America/Santiago"))
+    return now.astimezone(ZoneInfo("America/Santiago")).replace(tzinfo=None)<=_window_bounds(p)[1]
+
 
 def evaluate_real(p, es):
     # Fuente única de verdad compartida con el dashboard web.
@@ -561,7 +559,7 @@ async def send_alerts_for_new_events(new_events):
         print("No pude abrir el canal de alertas:",exc)
         return 0
 
-    predictions=get_real_group()
+    predictions=[p for p in get_real_group() if prediction_alert_active(p)]
     sent=0
 
     for e in new_events:
