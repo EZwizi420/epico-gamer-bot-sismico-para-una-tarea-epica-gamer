@@ -826,6 +826,69 @@ def _volume_inventory(root=Path("/data"), limit=12):
             "dirs": dirs[:limit], "errors": errors[:3]}
 
 
+
+def _volume_filesystem_diagnostic(root=Path("/data")):
+    """Diagnóstico de solo lectura: bloques, statvfs y ficheros borrados abiertos."""
+    root = Path(root)
+    if not root.is_dir():
+        return {"error": f"No existe o no es accesible: {root}"}
+    result = {"errors": []}
+    try:
+        st = os.statvfs(root)
+        result["capacity"] = st.f_blocks * st.f_frsize
+        result["used"] = (st.f_blocks - st.f_bfree) * st.f_frsize
+        result["available"] = st.f_bavail * st.f_frsize
+    except OSError as exc:
+        result["errors"].append(f"statvfs: {type(exc).__name__}: {exc}")
+    # st_size es el tamaño lógico; st_blocks contabiliza bloques realmente asignados.
+    allocated = 0
+    logical = 0
+    nfiles = 0
+    for base, subdirs, names in os.walk(root, followlinks=False,
+                                        onerror=lambda exc: result["errors"].append(str(exc))):
+        subdirs[:] = [n for n in subdirs if not (Path(base) / n).is_symlink()]
+        for name in names:
+            path = Path(base) / name
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                st = path.stat()
+                logical += st.st_size
+                allocated += getattr(st, "st_blocks", 0) * 512
+                nfiles += 1
+            except OSError as exc:
+                result["errors"].append(f"stat: {type(exc).__name__}: {exc}")
+    result.update(logical=logical, allocated=allocated, files=nfiles)
+    # Solo examina descriptores abiertos del proceso del bot: no inspecciona
+    # otros procesos ni lee contenidos. Puede no detectar borrados abiertos
+    # por procesos distintos o ficheros que ya no figuran en /proc.
+    deleted_bytes = 0
+    deleted_count = 0
+    fd_dir = Path("/proc/self/fd")
+    if fd_dir.is_dir():
+        try:
+            for fd in fd_dir.iterdir():
+                try:
+                    target = os.readlink(fd)
+                    if not target.endswith(" (deleted)"):
+                        continue
+                    # /proc/self/fd/<n> puede señalar sockets, pipes, etc.
+                    st = fd.stat()
+                    if not __import__('stat').S_ISREG(st.st_mode):
+                        continue
+                    deleted_count += 1
+                    deleted_bytes += getattr(st, "st_blocks", 0) * 512
+                except (OSError, ValueError):
+                    continue
+        except OSError as exc:
+            result["errors"].append(f"/proc/self/fd: {type(exc).__name__}: {exc}")
+    else:
+        result["errors"].append("No se puede consultar /proc/self/fd")
+    result["deleted_count"] = deleted_count
+    result["deleted_bytes"] = deleted_bytes
+    return result
+
+
 @bot.tree.command(name="almacenamiento",description="Diagnostica SQLite, backups y archivos grandes de /data sin borrar nada")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -840,8 +903,8 @@ async def c_almacenamiento(i:discord.Interaction):
             with connect() as con:
                 page_size = con.execute('PRAGMA page_size').fetchone()[0]
                 free = con.execute('PRAGMA freelist_count').fetchone()[0]
-            return size, free * page_size, _volume_inventory()
-        size, free_bytes, inventory = await __import__('asyncio').to_thread(report)
+            return size, free * page_size, _volume_inventory(), _volume_filesystem_diagnostic()
+        size, free_bytes, inventory, fs = await __import__('asyncio').to_thread(report)
         lines = ["💾 **Almacenamiento del bot (solo lectura)**",
                  f"SQLite (+ WAL/SHM): **{_human_bytes(size['db_bytes'])}**",
                  f"Backups: **{size['backup_count']}** · **{_human_bytes(size['backup_bytes'])}**",
@@ -857,6 +920,20 @@ async def c_almacenamiento(i:discord.Interaction):
             if inventory['errors']:
                 lines.append(f"⚠️ {len(inventory['errors'])} errores de lectura; total posiblemente incompleto.")
             lines.append("El total suma archivos visibles; puede diferir de la métrica de Railway.")
+        lines.append("**Diagnóstico del sistema de archivos (/data):**")
+        if 'error' in fs:
+            lines.append(f"⚠️ {fs['error']}")
+        else:
+            if 'used' in fs:
+                lines.append(f"Uso según sistema (statvfs): **{_human_bytes(fs['used'])}** · Capacidad: **{_human_bytes(fs['capacity'])}** · Disponible: **{_human_bytes(fs['available'])}**")
+            lines.append(f"Archivos visibles: **{fs['files']}** · Tamaño lógico: **{_human_bytes(fs['logical'])}** · Bloques asignados: **{_human_bytes(fs['allocated'])}**")
+            lines.append(f"Archivos borrados aún abiertos por este bot: **{fs['deleted_count']}** · Bloques: **{_human_bytes(fs['deleted_bytes'])}**")
+            if 'used' in fs:
+                difference = max(0, fs['used'] - fs['allocated'])
+                lines.append(f"Diferencia sistema − bloques visibles: **{_human_bytes(difference)}** (no identifica por sí sola la causa)")
+            if fs['errors']:
+                lines.append(f"⚠️ {len(fs['errors'])} avisos de inspección; el diagnóstico puede ser incompleto.")
+            lines.append("El conteo de archivos borrados solo revisa este proceso. La métrica de Railway puede diferir por el montaje, otros procesos o retrasos de actualización.")
         message = "\n".join(lines)
         # Dividir por líneas para evitar el límite de 2000 caracteres de Discord.
         parts=[]; current=""
