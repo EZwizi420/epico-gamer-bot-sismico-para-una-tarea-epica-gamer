@@ -791,7 +791,42 @@ async def send_alerts_for_new_events(new_events):
 intents=discord.Intents.default()
 bot=commands.Bot(command_prefix="!",intents=intents)
 
-@bot.tree.command(name="almacenamiento",description="Muestra tamaño de SQLite, backups y registros por tabla")
+def _volume_inventory(root=Path("/data"), limit=12):
+    """Inventario solo lectura del volumen; no sigue enlaces simbólicos."""
+    root = Path(root)
+    if not root.is_dir():
+        return {"error": f"No existe o no es accesible: {root}"}
+    files = []
+    dirs = []
+    errors = []
+    total = 0
+    count = 0
+    # os.walk no sigue directorios enlazados por defecto. No se inspeccionan
+    # rutas externas al volumen ni se muestran contenidos de archivos.
+    for base, subdirs, filenames in os.walk(root, followlinks=False, onerror=lambda exc: errors.append(str(exc))):
+        subdirs[:] = [name for name in subdirs if not (Path(base) / name).is_symlink()]
+        folder_bytes = 0
+        for name in filenames:
+            item = Path(base) / name
+            try:
+                if item.is_symlink() or not item.is_file():
+                    continue
+                size = item.stat().st_size
+            except OSError as exc:
+                errors.append(f"{item}: {exc}")
+                continue
+            total += size
+            folder_bytes += size
+            count += 1
+            files.append((size, str(item.relative_to(root))))
+        dirs.append((folder_bytes, str(Path(base).relative_to(root))))
+    files.sort(key=lambda row: row[0], reverse=True)
+    dirs.sort(key=lambda row: row[0], reverse=True)
+    return {"total": total, "count": count, "files": files[:limit],
+            "dirs": dirs[:limit], "errors": errors[:3]}
+
+
+@bot.tree.command(name="almacenamiento",description="Diagnostica SQLite, backups y archivos grandes de /data sin borrar nada")
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 async def c_almacenamiento(i:discord.Interaction):
@@ -801,23 +836,37 @@ async def c_almacenamiento(i:discord.Interaction):
     await i.response.defer(ephemeral=True)
     try:
         def report():
-            size=storage_report()
+            size = storage_report()
             with connect() as con:
-                tables=[r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-                counts=[(t,con.execute('SELECT COUNT(*) FROM "'+t+'"').fetchone()[0]) for t in tables]
-                page_size=con.execute('PRAGMA page_size').fetchone()[0]
-                page_count=con.execute('PRAGMA page_count').fetchone()[0]
-                free=con.execute('PRAGMA freelist_count').fetchone()[0]
-            return size,counts,page_size,page_count,free
-        size,counts,page_size,pages,free=await __import__('asyncio').to_thread(report)
-        lines=["💾 **Almacenamiento del bot**",
-               f"Base SQLite (+ WAL/SHM): **{_human_bytes(size['db_bytes'])}**",
-               f"Backups: **{size['backup_count']}** · **{_human_bytes(size['backup_bytes'])}**",
-               f"Espacio reutilizable dentro de SQLite: **{_human_bytes(free*page_size)}**",
-               "**Registros por tabla** (cantidad, no tamaño en bytes):"]
-        lines += [f"`{t}`: **{n}**" for t,n in counts]
-        lines.append("Borrar filas no reduce necesariamente el tamaño físico de SQLite; no se compacta automáticamente.")
-        await i.followup.send("\n".join(lines)[:1950],ephemeral=True)
+                page_size = con.execute('PRAGMA page_size').fetchone()[0]
+                free = con.execute('PRAGMA freelist_count').fetchone()[0]
+            return size, free * page_size, _volume_inventory()
+        size, free_bytes, inventory = await __import__('asyncio').to_thread(report)
+        lines = ["💾 **Almacenamiento del bot (solo lectura)**",
+                 f"SQLite (+ WAL/SHM): **{_human_bytes(size['db_bytes'])}**",
+                 f"Backups: **{size['backup_count']}** · **{_human_bytes(size['backup_bytes'])}**",
+                 f"Reutilizable dentro de SQLite: **{_human_bytes(free_bytes)}**"]
+        if 'error' in inventory:
+            lines.append(f"⚠️ {inventory['error']}")
+        else:
+            lines += [f"📁 **/data: {_human_bytes(inventory['total'])} en {inventory['count']} archivos**",
+                      "**Archivos más grandes:**"]
+            lines += [f"`/{name}` — **{_human_bytes(n)}**" for n,name in inventory['files'][:10]]
+            lines.append("**Carpetas con archivos más grandes (sin subcarpetas):**")
+            lines += [f"`/{name}` — **{_human_bytes(n)}**" for n,name in inventory['dirs'][:5] if n]
+            if inventory['errors']:
+                lines.append(f"⚠️ {len(inventory['errors'])} errores de lectura; total posiblemente incompleto.")
+            lines.append("El total suma archivos visibles; puede diferir de la métrica de Railway.")
+        message = "\n".join(lines)
+        # Dividir por líneas para evitar el límite de 2000 caracteres de Discord.
+        parts=[]; current=""
+        for line in message.splitlines():
+            if len(current)+len(line)+1 > 1900:
+                parts.append(current);current=""
+            current += ("\n" if current else "") + line[:1800]
+        if current: parts.append(current)
+        for part in parts:
+            await i.followup.send(part,ephemeral=True)
     except Exception as exc:
         await i.followup.send(f"❌ Error: `{type(exc).__name__}: {str(exc)[:300]}`",ephemeral=True)
 
