@@ -2174,6 +2174,10 @@ async def c_score(i:discord.Interaction,codigo:str):
         emb.add_field(name="📈 Magnitud · 30%",value=f"**{sc['magnitude_pct']:.1f}%**\nReal: M{float(e['magnitude']):.1f} · Pred.: {float(p['mag_min']):.1f}–{float(p['mag_max']):.1f}",inline=True)
         emb.add_field(name="⏱️ Tiempo · 30%",value=f"**{sc['temporal_pct']:.1f}%**\nEvento: {dt:%d/%m/%Y %H:%M:%S}",inline=True)
         emb.add_field(name="🌎 Sismo más próximo al criterio",value=e["place"],inline=False)
+        if e["source_url"]:
+            emb.add_field(name="🔗 Informe oficial del sismo",value=f"[Ver sismo en CSN]({e['source_url']})",inline=False)
+        else:
+            emb.add_field(name="🔗 Informe oficial del sismo",value="Este sismo no tiene un enlace CSN guardado.",inline=False)
         emb.set_footer(text="Resultado: coincidencia 3/3 o score global ≥95%. Evento 3/3 priorizado cuando existe.")
         await i.followup.send(embed=emb)
     
