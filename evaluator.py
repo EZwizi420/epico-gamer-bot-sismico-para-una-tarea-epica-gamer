@@ -51,8 +51,18 @@ def evaluate_real(p,es,now=None):
         x={"e":e,"t":t_ok,"m":m_ok,"g":g_ok,"dist":dist}; candidates.append(x)
         if t_ok and m_ok and g_ok:matches.append(x)
     matches.sort(key=lambda x:(x["dist"],abs(x["e"]["magnitude"]-center)))
-    status="ACERTADA" if matches else ("NO ACERTADA" if real_window_finished(p,now) else "PENDIENTE")
-    return status,(matches[0] if matches else None),rad,candidates
+    # Regla experimental: coincidencia estricta 3/3 O score global >= 95%.
+    # Recalcular en cada consulta permite actualizar predicciones antes fallidas
+    # sin modificar ni eliminar registros históricos de la base de datos.
+    if matches:
+        return "ACERTADA", matches[0], rad, candidates
+    candidate, score = best_proximity(p, es)
+    if score is not None and score["score"] >= 95.0:
+        for x in candidates:
+            if x["e"]["source_id"] == candidate["source_id"]:
+                return "ACERTADA", x, rad, candidates
+    status = "NO ACERTADA" if real_window_finished(p, now) else "PENDIENTE"
+    return status, None, rad, candidates
 
 
 
@@ -66,7 +76,7 @@ def _field(row, *names, default=None):
     return default
 
 # ---------- v1.6: SCORE DE PROXIMIDAD ----------
-# IMPORTANT: this score is descriptive. It never changes the strict 3/3 result.
+# Experimental result: a score >= 95% also qualifies as ACERTADA.
 
 def _clamp01(x):
     return max(0.0, min(1.0, float(x)))
