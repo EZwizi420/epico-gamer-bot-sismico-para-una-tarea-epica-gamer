@@ -61,6 +61,11 @@ def evaluate_real(p,es,now=None):
         for x in candidates:
             if x["e"]["source_id"] == candidate["source_id"]:
                 return "ACERTADA", x, rad, candidates
+    # CASI: tiempo y ubicacion cumplen sus margenes, sin exigir magnitud ni score.
+    near = [x for x in candidates if x["t"] and x["g"]]
+    if near:
+        near.sort(key=lambda x: (x["dist"], abs(x["e"]["magnitude"] - center)))
+        return "CASI ACERTADA", near[0], rad, candidates
     status = "NO ACERTADA" if real_window_finished(p, now) else "PENDIENTE"
     return status, None, rad, candidates
 

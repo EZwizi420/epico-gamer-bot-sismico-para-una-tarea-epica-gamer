@@ -880,7 +880,7 @@ async def c_an(i:discord.Interaction,margen_horas:app_commands.Range[int,1,2]=2)
     lines=[f"📊 **CSN REAL · ±{margen_horas} h**"]
     for p in ps:
         st,b,rad,*_=evaluate(p,es,margen_horas)
-        icon={"ACERTADA":"🟢","PENDIENTE":"🟡","NO ACERTADA":"🔴"}[st]
+        icon={"ACERTADA":"🟢","PENDIENTE":"🟡","NO ACERTADA":"🔴","CASI ACERTADA":"🟠"}[st]
         lines.append(f"{icon} **{p['code']} — {st}** · radio {rad} km")
     await i.response.send_message("\n".join(lines)[:1950])
 
@@ -889,7 +889,7 @@ async def c_ver(i:discord.Interaction,codigo:str,margen_horas:app_commands.Range
     with connect() as con:p=con.execute("SELECT * FROM predictions WHERE UPPER(code)=UPPER(?)",(codigo,)).fetchone()
     if not p:await i.response.send_message("❌ No encontrada.");return
     st,b,rad,cands,start,end,lo,hi=evaluate(p,events(),margen_horas)
-    icon={"ACERTADA":"🟢","PENDIENTE":"🟡","NO ACERTADA":"🔴"}[st]
+    icon={"ACERTADA":"🟢","PENDIENTE":"🟡","NO ACERTADA":"🔴","CASI ACERTADA":"🟠"}[st]
     dt=datetime.fromisoformat(p["predicted_at"])
     text=(f"{icon} **{p['code']} — {st}**\nPredicción: {dt:%d/%m/%Y %H:%M}\n📍 {p['place']} "
           f"({p['latitude']:.4f}, {p['longitude']:.4f})\n📈 M{p['magnitude']:.1f} ±{p['mag_margin']:.1f} "
@@ -1085,7 +1085,7 @@ async def c_an_group(i:discord.Interaction,grupo:str):
     hits=0; finished=0
     for p in ps:
         st,b,rad,_=evaluate_real(p,es)
-        icon={"ACERTADA":"🟢","PENDIENTE":"🟡","NO ACERTADA":"🔴"}[st]
+        icon={"ACERTADA":"🟢","PENDIENTE":"🟡","NO ACERTADA":"🔴","CASI ACERTADA":"🟠"}[st]
         hits += st=="ACERTADA"
         finished += st!="PENDIENTE"
         lines.append(f"{icon} **{p['code']} — {st}** · M{p['mag_min']:.1f}–{p['mag_max']:.1f} · {rad} km")
@@ -1135,7 +1135,7 @@ async def c_ver_real(i:discord.Interaction,codigo:str):
 
     es = events()
     st,b,rad,cands = evaluate_real(p,es)
-    icon={"ACERTADA":"🟢","PENDIENTE":"🟡","NO ACERTADA":"🔴"}[st]
+    icon={"ACERTADA":"🟢","PENDIENTE":"🟡","NO ACERTADA":"🔴","CASI ACERTADA":"🟠"}[st]
 
     timeband=""
     if p["daily_time_start"]:
@@ -1343,19 +1343,20 @@ def build_experiment_pdf(output_path, group_name=None):
     story.append(Spacer(1,5*mm))
 
     results=[]
-    hit=miss=pending=0
+    hit=miss=pending=almost=0
     for pred in ps:
         st,b,rad,cands=evaluate_real(pred,es)
         results.append((pred,st,b,rad,cands))
         if st=="ACERTADA": hit+=1
         elif st=="NO ACERTADA": miss+=1
+        elif st=="CASI ACERTADA": almost+=1
         else: pending+=1
-    closed=hit+miss
+    closed=hit+miss+almost
     pct=(100.0*hit/closed) if closed else 0.0
 
-    summary=[["Predicciones","Acertadas","No acertadas","Pendientes","Precision cerrada","Eventos CSN"],
-             [str(len(ps)),str(hit),str(miss),str(pending),f"{pct:.1f}%" if closed else "-",str(len(es))]]
-    t=Table(summary, colWidths=[38*mm,35*mm,38*mm,35*mm,42*mm,35*mm])
+    summary=[["Predicciones","Acertadas","Casi acertadas","No acertadas","Pendientes","Precision cerrada","Eventos CSN"],
+             [str(len(ps)),str(hit),str(almost),str(miss),str(pending),f"{pct:.1f}%" if closed else "-",str(len(es))]]
+    t=Table(summary, colWidths=[34*mm,34*mm,39*mm,39*mm,34*mm,43*mm,34*mm])
     t.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#1f2937")),("TEXTCOLOR",(0,0),(-1,0),colors.white),
         ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("ALIGN",(0,0),(-1,-1),"CENTER"),
@@ -1369,21 +1370,22 @@ def build_experiment_pdf(output_path, group_name=None):
     groups={}
     for pred,st,b,rad,cands in results:
         g=pred["group_name"]
-        groups.setdefault(g,{"h":0,"m":0,"p":0})
+        groups.setdefault(g,{"h":0,"a":0,"m":0,"p":0})
         if st=="ACERTADA": groups[g]["h"]+=1
         elif st=="NO ACERTADA": groups[g]["m"]+=1
+        elif st=="CASI ACERTADA": groups[g]["a"]+=1
         else: groups[g]["p"]+=1
     rank=[]
     for g,v in groups.items():
-        c=v["h"]+v["m"]
+        c=v["h"]+v["a"]+v["m"]
         score=(100*v["h"]/c) if c else None
         rank.append((score if score is not None else -1,g,v))
     rank.sort(reverse=True)
-    rank_data=[["IA","Aciertos","Fallos","Pendientes","Precision"]]
+    rank_data=[["IA","Aciertos","Casi","Fallos","Pendientes","Precision"]]
     for score,g,v in rank:
-        rank_data.append([g,str(v["h"]),str(v["m"]),str(v["p"]),f"{score:.1f}%" if score>=0 else "-"])
-    if len(rank_data)==1: rank_data.append(["-","0","0","0","-"])
-    rt=Table(rank_data, colWidths=[55*mm,30*mm,30*mm,35*mm,35*mm], repeatRows=1)
+        rank_data.append([g,str(v["h"]),str(v["a"]),str(v["m"]),str(v["p"]),f"{score:.1f}%" if score>=0 else "-"])
+    if len(rank_data)==1: rank_data.append(["-","0","0","0","0","-"])
+    rt=Table(rank_data, colWidths=[55*mm,30*mm,30*mm,30*mm,35*mm,35*mm], repeatRows=1)
     rt.setStyle(TableStyle([
         ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#374151")),("TEXTCOLOR",(0,0),(-1,0),colors.white),
         ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("ALIGN",(1,1),(-1,-1),"CENTER"),
@@ -1423,10 +1425,10 @@ def build_experiment_pdf(output_path, group_name=None):
     story.append(dt)
 
     # Inspector section: one block per confirmed hit.
-    hits=[x for x in results if x[1]=="ACERTADA" and x[2]]
+    hits=[x for x in results if x[1] in ("ACERTADA", "CASI ACERTADA") and x[2]]
     if hits:
         story.append(PageBreak())
-        story.append(Paragraph("Inspector de coincidencias 3/3",h2))
+        story.append(Paragraph("Inspector de coincidencias acertadas y casi acertadas",h2))
         inspect=[["Prediccion","Sismo CSN","Distancia","Magnitud","Tiempo","Ubicacion","Enlace"]]
         for pred,st,b,rad,cands in hits:
             e=b["e"]; when=parse_datetime(e["occurred_at"])
@@ -2166,7 +2168,7 @@ async def c_score(i:discord.Interaction,codigo:str):
         if not sc:
             await i.followup.send("No hay sismos guardados para calcular el score.",ephemeral=True)
             return
-        strict="✅ ACERTADA" if status=="ACERTADA" else ("❌ NO ACERTADA" if status=="NO ACERTADA" else "🟡 PENDIENTE")
+        strict="✅ ACERTADA" if status=="ACERTADA" else ("🟠 CASI ACERTADA" if status=="CASI ACERTADA" else ("❌ NO ACERTADA" if status=="NO ACERTADA" else "🟡 PENDIENTE"))
         e=candidate
         dt=parse_datetime(e["occurred_at"])
         emb=discord.Embed(title=f"🎯 Score · {p['code']}",description=f"**{sc['score']:.1f}%** de proximidad\nResultado (3/3 o score ≥95%): **{strict}**",color=discord.Color.blurple())
