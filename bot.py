@@ -1,6 +1,7 @@
 import ast
 import os, re, math, sqlite3, hashlib, threading, tempfile, resource
 import time as pytime
+from io import BytesIO
 from datetime import datetime, date, time, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -9,7 +10,9 @@ import discord
 import requests
 from discord import app_commands
 from discord.ext import commands, tasks
-from openpyxl import load_workbook
+from openpyxl import load_workbook, Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4, landscape
@@ -1102,6 +1105,93 @@ async def c_an_group(i:discord.Interaction,grupo:str):
         chunk+=("\n" if chunk else "")+line
     if chunk:
         await i.followup.send(chunk)
+
+def build_results_excel(predictions, observed):
+    """Exporta una instantánea; no modifica las predicciones ni la base de datos."""
+    wb = Workbook()
+    summary = wb.active
+    summary.title = "RESUMEN"
+    columns = ["Grupo", "Código", "Estado", "Fecha inicio", "Fecha fin", "Hora inicio", "Hora fin",
+               "Lugar predicho", "Magnitud mín.", "Magnitud máx.", "Latitud pred.", "Longitud pred.",
+               "Radio (km)", "ID sismo CSN", "Fecha sismo", "Lugar sismo", "Magnitud sismo",
+               "Distancia (km)", "Tiempo válido", "Ubicación válida", "Magnitud válida", "Enlace oficial CSN"]
+    categories = ("ACERTADA", "CASI ACERTADA", "NO ACERTADA", "PENDIENTE")
+    names = {"ACERTADA": "ACERTADAS", "CASI ACERTADA": "CASI ACERTADAS",
+             "NO ACERTADA": "NO ACERTADAS", "PENDIENTE": "PENDIENTES"}
+    tabs = {status: wb.create_sheet(names[status]) for status in categories}
+    for ws in tabs.values():
+        ws.append(columns)
+    counts = {}
+    for p in predictions:
+        status, match, rad, _ = evaluate_real(p, observed)
+        group = p["group_name"]
+        if group not in counts:
+            counts[group] = {key: 0 for key in categories}
+        counts[group][status] += 1
+        e = match["e"] if match else None
+        row = [group, p["code"], status, p["date_start"], p["date_end"],
+               p["daily_time_start"], p["daily_time_end"], p["place"],
+               p["mag_min"], p["mag_max"], p["latitude"], p["longitude"], rad,
+               e["source_id"] if e else None, str(e["occurred_at"]) if e else None,
+               e["place"] if e else None, e["magnitude"] if e else None,
+               round(match["dist"], 2) if match else None,
+               "SÍ" if match["t"] else "NO" if match else None,
+               "SÍ" if match["g"] else "NO" if match else None,
+               "SÍ" if match["m"] else "NO" if match else None,
+               e["source_url"] if e else None]
+        tabs[status].append(row)
+    summary.append(["Grupo", "Acertadas", "Casi acertadas", "No acertadas", "Pendientes", "Total"])
+    for group in sorted(counts):
+        c = counts[group]
+        summary.append([group, c["ACERTADA"], c["CASI ACERTADA"], c["NO ACERTADA"],
+                        c["PENDIENTE"], sum(c.values())])
+    summary.append(["TOTAL"] + [sum(c[key] for c in counts.values()) for key in categories] + [len(predictions)])
+    summary.append([])
+    summary.append(["Clasificación recalculada al exportar con los eventos CSN guardados en el bot."])
+    summary.append(["Una predicción pendiente no se considera no acertada hasta cerrar su ventana."])
+    for ws in [summary, *tabs.values()]:
+        ws.freeze_panes = "D2" if ws is not summary else "B2"
+        ws.auto_filter.ref = f"A1:{get_column_letter(ws.max_column)}{max(1, ws.max_row if ws is not summary else len(counts)+2)}"
+        for cell in ws[1]:
+            cell.font = Font(color="FFFFFF", bold=True)
+            cell.fill = PatternFill("solid", fgColor="17365D")
+            cell.alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[1].height = 32
+        for idx in range(1, ws.max_column+1):
+            width = 17
+            if ws is not summary:
+                width = {2:20, 3:19, 8:32, 16:32, 22:47}.get(idx, 17)
+            ws.column_dimensions[get_column_letter(idx)].width = width
+        if ws is not summary:
+            for row in ws.iter_rows(min_row=2):
+                if row[21].value:
+                    row[21].hyperlink = row[21].value
+                    row[21].font = Font(color="0563C1", underline="single")
+    output = BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output, counts
+
+
+@bot.tree.command(name="exportar_excel", description="Descarga un Excel de acertadas, casi acertadas, no acertadas y pendientes")
+@app_commands.describe(grupo="Opcional: nombre de la IA; vacío para incluir todos los grupos")
+async def c_export_excel(i:discord.Interaction, grupo:str=None):
+    await i.response.defer(thinking=True)
+    try:
+        ps = get_real_group(grupo) if grupo else get_real_group()
+        if not ps:
+            await i.followup.send("No hay predicciones importadas para ese grupo." if grupo else "No hay predicciones importadas. Usa `/importar_todos`.")
+            return
+        output, counts = await __import__('asyncio').to_thread(build_results_excel, ps, events())
+        if output.getbuffer().nbytes > 8 * 1024 * 1024:
+            await i.followup.send("El Excel supera 8 MB. Prueba exportar un grupo específico con `/exportar_excel grupo:`.")
+            return
+        filename = "resultados_csn_" + (re.sub(r"[^a-zA-Z0-9_-]", "_", grupo.upper()) if grupo else "TODOS") + ".xlsx"
+        await i.followup.send("📊 Excel generado con las categorías actuales y un resumen por grupo.",
+                              file=discord.File(output, filename=filename))
+    except Exception as exc:
+        await i.followup.send(f"❌ No se pudo generar el Excel: `{type(exc).__name__}: {str(exc)[:300]}`")
+
 
 @bot.tree.command(name="analizar_todos",description="Compara todos los grupos reales importados")
 async def c_an_all(i:discord.Interaction):
