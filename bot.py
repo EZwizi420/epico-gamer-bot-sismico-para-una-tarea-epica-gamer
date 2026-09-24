@@ -1081,19 +1081,27 @@ async def c_an_group(i:discord.Interaction,grupo:str):
         await i.response.send_message("No hay eventos CSN. Usa `/importar_historico`.")
         return
 
+    counts={"ACERTADA":0,"CASI ACERTADA":0,"NO ACERTADA":0,"PENDIENTE":0}
     lines=[f"📊 **{grupo.upper()} · CSN REAL**"]
-    hits=0; finished=0
+    icons={"ACERTADA":"🟢","CASI ACERTADA":"🟠","NO ACERTADA":"🔴","PENDIENTE":"🟡"}
     for p in ps:
         st,b,rad,_=evaluate_real(p,es)
-        icon={"ACERTADA":"🟢","PENDIENTE":"🟡","NO ACERTADA":"🔴","CASI ACERTADA":"🟠"}[st]
-        hits += st=="ACERTADA"
-        finished += st!="PENDIENTE"
-        lines.append(f"{icon} **{p['code']} — {st}** · M{p['mag_min']:.1f}–{p['mag_max']:.1f} · {rad} km")
-    if finished:
-        lines.append(f"\nResultado cerrado hasta ahora: **{hits}/{finished} acertadas ({hits/finished*100:.1f}%)**")
-    pending=len(ps)-finished
-    if pending: lines.append(f"Pendientes: **{pending}**")
-    await i.response.send_message("\n".join(lines)[:1950])
+        counts[st]+=1
+        lines.append(f"{icons[st]} **{p['code']} — {st}** · M{p['mag_min']:.1f}–{p['mag_max']:.1f} · {rad} km")
+    closed=len(ps)-counts["PENDIENTE"]
+    lines.append(f"\n🟢 Acertadas: **{counts['ACERTADA']}** · 🟠 Casi acertadas: **{counts['CASI ACERTADA']}** · 🔴 No acertadas: **{counts['NO ACERTADA']}** · 🟡 Pendientes: **{counts['PENDIENTE']}**")
+    if closed:
+        lines.append(f"Aciertos sobre resultados cerrados: **{counts['ACERTADA']}/{closed} ({counts['ACERTADA']/closed*100:.1f}%)**")
+    # Discord limita los mensajes a 2000 caracteres; enviar todas las predicciones.
+    await i.response.defer()
+    chunk=""
+    for line in lines:
+        if len(chunk)+len(line)+1>1900:
+            await i.followup.send(chunk)
+            chunk=""
+        chunk+=("\n" if chunk else "")+line
+    if chunk:
+        await i.followup.send(chunk)
 
 @bot.tree.command(name="analizar_todos",description="Compara todos los grupos reales importados")
 async def c_an_all(i:discord.Interaction):
@@ -1110,15 +1118,16 @@ async def c_an_all(i:discord.Interaction):
     for p in ps: groups.setdefault(p["group_name"],[]).append(p)
     lines=["🏁 **COMPARACIÓN DE IA · CSN REAL**"]
     for group,gps in groups.items():
-        hits=misses=pending=0
+        hits=almost=misses=pending=0
         for p in gps:
             st,_,_,_=evaluate_real(p,es)
             if st=="ACERTADA": hits+=1
+            elif st=="CASI ACERTADA": almost+=1
             elif st=="NO ACERTADA": misses+=1
             else: pending+=1
-        closed=hits+misses
+        closed=hits+almost+misses
         score=f"{hits}/{closed} ({hits/closed*100:.1f}%)" if closed else "sin resultados cerrados"
-        lines.append(f"**{group}** → {score} · 🟡 {pending} pendientes")
+        lines.append(f"**{group}** → {score} · 🟠 {almost} casi · 🔴 {misses} no acertadas · 🟡 {pending} pendientes")
     await i.response.send_message("\n".join(lines)[:1950])
 
 @bot.tree.command(name="ver_real",description="Detalle y enlace CSN de una predicción real")
