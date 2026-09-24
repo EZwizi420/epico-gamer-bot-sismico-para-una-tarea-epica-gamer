@@ -1135,9 +1135,9 @@ def build_results_excel(predictions, observed):
                e["source_id"] if e else None, str(e["occurred_at"]) if e else None,
                e["place"] if e else None, e["magnitude"] if e else None,
                round(match["dist"], 2) if match else None,
-               "SÍ" if match["t"] else "NO" if match else None,
-               "SÍ" if match["g"] else "NO" if match else None,
-               "SÍ" if match["m"] else "NO" if match else None,
+               ("SÍ" if match["t"] else "NO") if match is not None else None,
+               ("SÍ" if match["g"] else "NO") if match is not None else None,
+               ("SÍ" if match["m"] else "NO") if match is not None else None,
                e["source_url"] if e else None]
         tabs[status].append(row)
     summary.append(["Grupo", "Acertadas", "Casi acertadas", "No acertadas", "Pendientes", "Total"])
