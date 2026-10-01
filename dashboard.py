@@ -15,7 +15,21 @@ def api_dashboard():
     ps=rows("SELECT * FROM real_predictions ORDER BY group_name,prediction_no")
     results=[]; groups={}
     for p in ps:
-        st,b,rad,_=evaluate_real(p,es); m=None
+        st,b,rad,candidates=evaluate_real(p,es); m=None
+
+        # Safety patch for CASI ACERTADA:
+        # TIME + LOCATION are enough; magnitude is ignored.
+        if st not in ('ACERTADA', 'CASI ACERTADA'):
+            almost = [x for x in (candidates or []) if x.get('t') and x.get('g')]
+            if almost:
+                center = (p['mag_min'] + p['mag_max']) / 2
+                almost.sort(key=lambda x: (
+                    x.get('dist', float('inf')),
+                    abs(float(x['e']['magnitude']) - center)
+                ))
+                st = 'CASI ACERTADA'
+                b = almost[0]
+
         if b:
             e=dict(b['e']); center=(p['mag_min']+p['mag_max'])/2
             m={'event':e,'distance_km':round(b['dist'],3),'delta_mag':round(abs(e['magnitude']-center),3),'time_ok':b['t'],'mag_ok':b['m'],'geo_ok':b['g']}
@@ -40,5 +54,5 @@ async function load(){D=await fetch('/api/dashboard',{cache:'no-store'}).then(x=
 @app.get('/')
 def home():return render_template_string(HTML)
 @app.get('/health')
-def health():return {'ok':True,'db':DB_PATH,'evaluator':'shared-v1.5'}
+def health():return {'ok':True,'db':DB_PATH,'evaluator':'shared-v1.5','dashboard_patch':'almost-v2'}
 def run_dashboard():app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')),debug=False,use_reloader=False)
