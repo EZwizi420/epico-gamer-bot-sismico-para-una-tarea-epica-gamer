@@ -1364,20 +1364,21 @@ async def c_ranking(i:discord.Interaction):
     for p in ps: groups.setdefault(p["group_name"],[]).append(p)
     rows=[]
     for group,gps in groups.items():
-        hits=misses=pending=0
+        hits=almost=misses=pending=0
         for p in gps:
             st,_,_,_=evaluate_real(p,es)
             if st=="ACERTADA": hits+=1
+            elif st=="CASI ACERTADA": almost+=1
             elif st=="NO ACERTADA": misses+=1
             else: pending+=1
-        closed=hits+misses
+        closed=hits+almost+misses
         pct=(100*hits/closed) if closed else None
-        rows.append((pct if pct is not None else -1,group,hits,closed,pending))
+        rows.append((pct if pct is not None else -1,group,hits,almost,misses,closed,pending))
     rows.sort(reverse=True)
     lines=["🏆 **RANKING DE PREDICCIONES**"]
-    for pct,g,h,c,pend in rows:
+    for pct,g,h,a,m,c,pend in rows:
         score=f"{h}/{c} ({pct:.1f}%)" if c else "sin resultados cerrados"
-        lines.append(f"**{g}** → {score} · 🟡 {pend}")
+        lines.append(f"**{g}** → {score} · ✅ {h} · 🟠 {a} · ❌ {m} · 🟡 {pend}")
     await i.response.send_message("\n".join(lines)[:1950])
 
 @bot.tree.command(name="historial",description="Últimas correlaciones detectadas")
@@ -1797,27 +1798,28 @@ def build_ranking_embed():
         groups.setdefault(p["group_name"],[]).append(p)
     rows=[]
     for group,gps in groups.items():
-        hits=misses=pending=0
+        hits=almost=misses=pending=0
         for p in gps:
             st,_,_,_=evaluate_real(p,es)
             if st=="ACERTADA": hits+=1
+            elif st=="CASI ACERTADA": almost+=1
             elif st=="NO ACERTADA": misses+=1
             else: pending+=1
-        closed=hits+misses
+        closed=hits+almost+misses
         pct=(100*hits/closed) if closed else None
-        rows.append((pct if pct is not None else -1,group,hits,misses,pending))
+        rows.append((pct if pct is not None else -1,group,hits,almost,misses,pending))
     rows.sort(reverse=True)
-    e=ui_embed("🏆 Ranking por IA","Resultados cerrados; las pendientes no cuentan en el porcentaje.")
+    e=ui_embed("🏆 Ranking por IA","Resultados cerrados; casi acertadas cuentan como cerradas, no como aciertos.")
     if not rows:
         e.description="Todavía no hay predicciones importadas."
         return e
     medals=["🥇","🥈","🥉"]
-    for idx,(pct,g,h,m,pending) in enumerate(rows[:10]):
+    for idx,(pct,g,h,a,m,pending) in enumerate(rows[:10]):
         icon=medals[idx] if idx<3 else "▫️"
         score=f"{pct:.1f}%" if pct>=0 else "—"
         e.add_field(
             name=f"{icon} {g} · {score}",
-            value=f"✅ {h}  •  ❌ {m}  •  🟡 {pending}",
+            value=f"✅ {h}  •  🟠 {a}  •  ❌ {m}  •  🟡 {pending}",
             inline=False
         )
     return e
