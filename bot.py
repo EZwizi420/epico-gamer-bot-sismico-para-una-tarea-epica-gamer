@@ -2006,15 +2006,17 @@ class PredictionsPanel(discord.ui.View):
     async def summary(self, interaction, button):
         ps=get_real_group()
         es=events()
-        hit=miss=pending=0
+        hit=almost=miss=pending=0
         for p in ps:
             st,_,_,_=evaluate_real(p,es)
             if st=="ACERTADA": hit+=1
+            elif st=="CASI ACERTADA": almost+=1
             elif st=="NO ACERTADA": miss+=1
-            else: pending+=1
+            elif st=="PENDIENTE": pending+=1
         e=ui_embed("🎯 Predicciones")
         e.add_field(name="Total",value=f"**{len(ps)}**",inline=True)
         e.add_field(name="✅ Acertadas",value=f"**{hit}**",inline=True)
+        e.add_field(name="🟠 Casi acertadas",value=f"**{almost}**",inline=True)
         e.add_field(name="❌ No acertadas",value=f"**{miss}**",inline=True)
         e.add_field(name="🟡 Pendientes",value=f"**{pending}**",inline=True)
         await interaction.response.send_message(embed=e,ephemeral=True)
