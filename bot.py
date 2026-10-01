@@ -1373,12 +1373,23 @@ async def c_ranking(i:discord.Interaction):
             else: pending+=1
         closed=hits+almost+misses
         pct=(100*hits/closed) if closed else None
-        rows.append((pct if pct is not None else -1,group,hits,almost,misses,closed,pending))
-    rows.sort(reverse=True)
+        # Desempate: si dos IAs tienen la misma cantidad de aciertos,
+        # gana la que tenga mayor score promedio de proximidad en resultados cerrados.
+        group_scores=[]
+        for p in gps:
+            st,_,_,_=evaluate_real(p,es)
+            if st == "PENDIENTE":
+                continue
+            _, sc = best_proximity(p,es,DEFAULT_MARGIN_HOURS)
+            if sc:
+                group_scores.append(float(sc["score"]))
+        avg_score=(sum(group_scores)/len(group_scores)) if group_scores else 0.0
+        rows.append((hits,avg_score,pct if pct is not None else -1,group,almost,misses,closed,pending))
+    rows.sort(key=lambda r:(r[0],r[1],r[2]), reverse=True)
     lines=["🏆 **RANKING DE PREDICCIONES**"]
-    for pct,g,h,a,m,c,pend in rows:
-        score=f"{h}/{c} ({pct:.1f}%)" if c else "sin resultados cerrados"
-        lines.append(f"**{g}** → {score} · ✅ {h} · 🟠 {a} · ❌ {m} · 🟡 {pend}")
+    for h,avg_score,pct,g,a,m,c,pend in rows:
+        result=f"{h}/{c} ({pct:.1f}%)" if c else "sin resultados cerrados"
+        lines.append(f"**{g}** → {result} · 🎯 Score {avg_score:.1f}% · ✅ {h} · 🟠 {a} · ❌ {m} · 🟡 {pend}")
     await i.response.send_message("\n".join(lines)[:1950])
 
 @bot.tree.command(name="historial",description="Últimas correlaciones detectadas")
@@ -1807,18 +1818,27 @@ def build_ranking_embed():
             else: pending+=1
         closed=hits+almost+misses
         pct=(100*hits/closed) if closed else None
-        rows.append((pct if pct is not None else -1,group,hits,almost,misses,pending))
-    rows.sort(reverse=True)
-    e=ui_embed("🏆 Ranking por IA","Resultados cerrados; casi acertadas cuentan como cerradas, no como aciertos.")
+        group_scores=[]
+        for p in gps:
+            st,_,_,_=evaluate_real(p,es)
+            if st == "PENDIENTE":
+                continue
+            _, sc = best_proximity(p,es,DEFAULT_MARGIN_HOURS)
+            if sc:
+                group_scores.append(float(sc["score"]))
+        avg_score=(sum(group_scores)/len(group_scores)) if group_scores else 0.0
+        rows.append((hits,avg_score,pct if pct is not None else -1,group,almost,misses,pending))
+    rows.sort(key=lambda r:(r[0],r[1],r[2]), reverse=True)
+    e=ui_embed("🏆 Ranking por IA","Ordenado por aciertos; en empate, mayor score promedio de proximidad.")
     if not rows:
         e.description="Todavía no hay predicciones importadas."
         return e
     medals=["🥇","🥈","🥉"]
-    for idx,(pct,g,h,a,m,pending) in enumerate(rows[:10]):
+    for idx,(h,avg_score,pct,g,a,m,pending) in enumerate(rows[:10]):
         icon=medals[idx] if idx<3 else "▫️"
-        score=f"{pct:.1f}%" if pct>=0 else "—"
+        hit_pct=f"{pct:.1f}%" if pct>=0 else "—"
         e.add_field(
-            name=f"{icon} {g} · {score}",
+            name=f"{icon} {g} · {hit_pct} · 🎯 {avg_score:.1f}%",
             value=f"✅ {h}  •  🟠 {a}  •  ❌ {m}  •  🟡 {pending}",
             inline=False
         )
