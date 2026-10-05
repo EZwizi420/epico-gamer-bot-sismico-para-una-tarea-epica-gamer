@@ -2015,7 +2015,14 @@ def build_activity_embed():
         e.add_field(name="⏳ Próximas en finalizar",value="\n".join(f"• **{x[0]['code']}** · {_window_bounds(x[0])[1]:%d/%m %H:%M}" for x in upcoming),inline=False)
     recent=[x for x in finished if x[1] in ('ACERTADA','CASI ACERTADA') and x[2] is not None]
     if recent:
-        recent.sort(key=lambda z:parse_datetime(z[2]['e']['occurred_at']),reverse=True); pred,st,b=recent[0]
+        def _activity_sort_dt(z):
+            dt = parse_datetime(z[2]['e']['occurred_at'])
+            if dt is None:
+                return datetime.min.replace(tzinfo=timezone.utc)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        recent.sort(key=_activity_sort_dt, reverse=True); pred,st,b=recent[0]
         e.add_field(name="✨ Último resultado destacado",value=f"{_status_icon(st)} **{pred['code']}** · {st}\n🌎 M{b['e']['magnitude']:.1f} · {b['e']['place'] or 'Sin referencia'}",inline=False)
     return e
 
@@ -2570,8 +2577,10 @@ class MainPanel(discord.ui.View):
         await interaction.response.send_message(embed=build_activity_embed(),ephemeral=True)
 
     @discord.ui.button(label="Investigación", emoji="🧪", style=discord.ButtonStyle.success, row=2)
-    async def research(self,interaction,button):
-        save_ranking_snapshot(); await interaction.response.send_message(embed=build_research_embed(),view=ResearchView(),ephemeral=True)
+    async def research(self, interaction, button):
+        await interaction.response.defer(ephemeral=True)
+        save_ranking_snapshot()
+        await interaction.edit_original_response(embed=build_research_embed(), view=ResearchView())
 
     @discord.ui.button(label="Ayuda", emoji="❓", style=discord.ButtonStyle.secondary, row=1)
     async def help(self,interaction,button):
