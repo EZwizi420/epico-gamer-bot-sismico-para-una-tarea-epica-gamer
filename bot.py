@@ -2,7 +2,7 @@ import ast
 import os, re, math, sqlite3, hashlib, threading, tempfile, resource, json, struct, zlib
 import time as pytime
 from io import BytesIO
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, date, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
