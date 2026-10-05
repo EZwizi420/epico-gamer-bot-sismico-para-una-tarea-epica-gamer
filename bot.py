@@ -1,5 +1,5 @@
 import ast
-import os, re, math, sqlite3, hashlib, threading, tempfile, resource
+import os, re, math, sqlite3, hashlib, threading, tempfile, resource, json, struct, zlib
 import time as pytime
 from io import BytesIO
 from datetime import datetime, date, time, timedelta
@@ -100,6 +100,11 @@ def init_db():
           distance_km REAL NOT NULL,
           source_url TEXT,
           PRIMARY KEY(event_source_id,prediction_code,match_level)
+        );
+        CREATE TABLE IF NOT EXISTS ranking_snapshots(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          captured_at TEXT NOT NULL,
+          ranking_json TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS observed_events(
           id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, source_id TEXT NOT NULL,
@@ -815,6 +820,7 @@ async def csn_loop():
             alerts_sent=await send_alerts_for_new_events(newly_saved)
             if feed_sent or alerts_sent:
                 print(f"Discord: feed CSN={feed_sent}, alertas correlación={alerts_sent}")
+            save_ranking_snapshot()
 
         if errs:
             print("CSN avisos:",errs[:3])
@@ -1801,6 +1807,117 @@ def ranking_rows():
     rows.sort(key=lambda r:(-r[1],-r[2],r[3],r[4],r[0].lower()))
     return rows
 
+def save_ranking_snapshot(force=False):
+    """Guarda una foto del ranking solo cuando cambia. El historial empieza al instalar esta versión."""
+    rows=ranking_rows()
+    payload=json.dumps(rows,ensure_ascii=False,separators=(",",":"))
+    with connect() as con:
+        last=con.execute("SELECT ranking_json FROM ranking_snapshots ORDER BY id DESC LIMIT 1").fetchone()
+        if force or last is None or last["ranking_json"]!=payload:
+            con.execute("INSERT INTO ranking_snapshots(captured_at,ranking_json) VALUES(?,?)",(datetime.now().isoformat(),payload))
+            return True
+    return False
+
+def _ranking_history():
+    with connect() as con:
+        return con.execute("SELECT * FROM ranking_snapshots ORDER BY id ASC").fetchall()
+
+def build_evolution_embed():
+    hist=_ranking_history(); e=ui_embed("📈 Evolución del ranking","Historial de posiciones guardado desde la instalación de esta actualización.")
+    if not hist:
+        e.description += "\n\nAún no hay snapshots. Se guardará uno cuando cambien los resultados del experimento."
+        return e
+    first=json.loads(hist[0]["ranking_json"]); last=json.loads(hist[-1]["ranking_json"])
+    groups=[]
+    for r in last:
+        if r[0] not in groups: groups.append(r[0])
+    for g in groups[:10]:
+        seq=[]
+        for row in hist:
+            data=json.loads(row["ranking_json"]); pos=next((i+1 for i,x in enumerate(data) if x[0]==g),None)
+            if pos is not None and (not seq or seq[-1]!=pos): seq.append(pos)
+        current=next((i+1 for i,x in enumerate(last) if x[0]==g),None)
+        initial=next((i+1 for i,x in enumerate(first) if x[0]==g),None)
+        delta=(initial-current) if initial and current else 0
+        trend=(f"▲ {delta}" if delta>0 else f"▼ {abs(delta)}" if delta<0 else "• 0")
+        path=" → ".join(f"#{x}" for x in seq[-8:]) or f"#{current}"
+        e.add_field(name=f"{'🏆 ' if current==1 else ''}{g}",value=f"{path}\nCambio: **{trend}** · actual **#{current}**",inline=False)
+    e.set_footer(text=f"{len(hist)} snapshots · no reconstruye posiciones anteriores a esta versión")
+    return e
+
+# PNG mínimo con stdlib: evita añadir dependencias a Railway.
+def _png_chunk(kind,data):
+    return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data)&0xffffffff)
+
+def _encode_png_rgb(w,h,pixels):
+    raw=b''.join(b'\x00'+bytes(pixels[y*w*3:(y+1)*w*3]) for y in range(h))
+    return b'\x89PNG\r\n\x1a\n'+_png_chunk(b'IHDR',struct.pack('>IIBBBBB',w,h,8,2,0,0,0))+_png_chunk(b'IDAT',zlib.compress(raw,9))+_png_chunk(b'IEND',b'')
+
+def _dot(px,w,h,x,y,r,color):
+    for yy in range(max(0,y-r),min(h,y+r+1)):
+        for xx in range(max(0,x-r),min(w,x+r+1)):
+            if (xx-x)**2+(yy-y)**2<=r*r:
+                i=(yy*w+xx)*3; px[i:i+3]=color
+
+def _line(px,w,h,x0,y0,x1,y1,color):
+    dx=abs(x1-x0); sx=1 if x0<x1 else -1; dy=-abs(y1-y0); sy=1 if y0<y1 else -1; err=dx+dy
+    while True:
+        if 0<=x0<w and 0<=y0<h:
+            i=(y0*w+x0)*3; px[i:i+3]=color
+        if x0==x1 and y0==y1: break
+        e2=2*err
+        if e2>=dy: err+=dy; x0+=sx
+        if e2<=dx: err+=dx; y0+=sy
+
+def build_prediction_map(group=None):
+    ps=get_real_group(group) if group else get_real_group(); es=events()
+    pairs=[]
+    for pred in ps:
+        ev,score=best_proximity(pred,es)
+        if ev is not None and score is not None: pairs.append((pred,ev,score))
+    if not pairs: return None,0
+    # Marco geográfico Chile + margen oceánico; se expande si los datos lo requieren.
+    lats=[float(p['latitude']) for p,_,_ in pairs]+[float(e['latitude']) for _,e,_ in pairs]
+    lons=[float(p['longitude']) for p,_,_ in pairs]+[float(e['longitude']) for _,e,_ in pairs]
+    lat_min=min(-57,min(lats)-1); lat_max=max(-17,max(lats)+1); lon_min=min(-77,min(lons)-1); lon_max=max(-66,max(lons)+1)
+    w,h=900,1200; margin=55; px=bytearray([248,249,250])*(w*h)
+    def xy(lat,lon):
+        x=margin+int((lon-lon_min)/(lon_max-lon_min)*(w-2*margin)); y=margin+int((lat_max-lat)/(lat_max-lat_min)*(h-2*margin)); return x,y
+    # rejilla geográfica
+    for lat in range(-55,-19,5):
+        x0,y=xy(lat,lon_min); x1,_=xy(lat,lon_max); _line(px,w,h,x0,y,x1,y,(220,224,228))
+    for lon in range(-75,-65,2):
+        x,y0=xy(lat_max,lon); _,y1=xy(lat_min,lon); _line(px,w,h,x,y0,x,y1,(220,224,228))
+    # silueta aproximada del eje chileno para orientación visual
+    chile=[(-17.5,-69.5),(-23,-70.4),(-30,-71.4),(-35,-72.5),(-41,-73.7),(-46,-74.5),(-52,-73.5),(-56,-68.5)]
+    for a,b in zip(chile,chile[1:]):
+        x0,y0=xy(*a); x1,y1=xy(*b); _line(px,w,h,x0,y0,x1,y1,(70,80,90))
+    for pred,ev,score in pairs:
+        xp,yp=xy(float(pred['latitude']),float(pred['longitude'])); xe,ye=xy(float(ev['latitude']),float(ev['longitude']))
+        _line(px,w,h,xp,yp,xe,ye,(160,160,160)); _dot(px,w,h,xp,yp,7,(220,55,55)); _dot(px,w,h,xe,ye,6,(45,105,210))
+    return _encode_png_rgb(w,h,px),len(pairs)
+
+def build_research_embed():
+    rows=ranking_rows(); ps=get_real_group(); es=events(); total=len(ps); finalized=0; hit=almost=miss=pending=0
+    for p in ps:
+        st,_,_,_=evaluate_real(p,es)
+        if st=='ACERTADA': hit+=1; finalized+=1
+        elif st=='CASI ACERTADA': almost+=1; finalized+=1
+        elif st=='NO ACERTADA': miss+=1; finalized+=1
+        else: pending+=1
+    e=ui_embed("🧪 Modo investigación","Vista centrada en resultados comparables del experimento, sin información técnica del bot.")
+    e.add_field(name="📦 Muestra",value=f"**{total}** predicciones · **{finalized}** finalizadas · **{pending}** pendientes",inline=False)
+    e.add_field(name="🎯 Resultados globales",value=f"✅ **{hit}** · 🟠 **{almost}** · ❌ **{miss}**",inline=False)
+    if rows:
+        top=rows[0]; e.add_field(name="🏆 Líder actual",value=f"**{top[0]}** · ✅ {top[1]} · 🟠 {top[2]} · ❌ {top[3]}",inline=False)
+    profiles=[]
+    for g,_,_,_,_ in rows[:5]:
+        a=_group_analysis(g); n=a['evaluated'] or 1
+        profiles.append(f"**{g}** — tiempo {100*a['time_ok']/n:.0f}% · magnitud {100*a['mag_ok']/n:.0f}% · ubicación {100*a['geo_ok']/n:.0f}%")
+    if profiles:e.add_field(name="🔬 Cumplimiento por criterio",value="\n".join(profiles),inline=False)
+    e.set_footer(text="Usa los botones para profundizar: ranking, comparar, mapa y evolución.")
+    return e
+
 def build_ranking_embed():
     rows=ranking_rows()
     e=ui_embed("🏆 Ranking por IA","Prioridad: **✅ aciertos → 🟠 casi acertados → ❌ menos no acertados**. Las pendientes no deciden el puesto.")
@@ -2246,6 +2363,17 @@ class PredictionsPanel(discord.ui.View):
     @discord.ui.button(label="Actividad", emoji="📡", style=discord.ButtonStyle.secondary, row=1)
     async def activity(self, interaction, button): await interaction.response.send_message(embed=build_activity_embed(),ephemeral=True)
 
+    @discord.ui.button(label="Evolución", emoji="📈", style=discord.ButtonStyle.secondary, row=2)
+    async def evolution(self, interaction, button):
+        save_ranking_snapshot(); await interaction.response.send_message(embed=build_evolution_embed(),ephemeral=True)
+
+    @discord.ui.button(label="Mapa", emoji="🗺️", style=discord.ButtonStyle.secondary, row=2)
+    async def map_view(self, interaction, button):
+        await interaction.response.defer(ephemeral=True); data,n=build_prediction_map()
+        if not data: await interaction.followup.send("No hay suficientes datos para el mapa.",ephemeral=True); return
+        e=ui_embed("🗺️ Predicción vs realidad",f"**{n}** pares · 🔴 predicción · 🔵 CSN"); e.set_image(url="attachment://mapa_predicciones.png")
+        await interaction.followup.send(embed=e,file=discord.File(BytesIO(data),filename="mapa_predicciones.png"),ephemeral=True)
+
     @discord.ui.button(label="Integridad", emoji="🔒", style=discord.ButtonStyle.secondary, row=1)
     async def integrity(self, interaction, button):
         ps=get_real_group()
@@ -2441,10 +2569,56 @@ class MainPanel(discord.ui.View):
     async def activity(self,interaction,button):
         await interaction.response.send_message(embed=build_activity_embed(),ephemeral=True)
 
+    @discord.ui.button(label="Investigación", emoji="🧪", style=discord.ButtonStyle.success, row=2)
+    async def research(self,interaction,button):
+        save_ranking_snapshot(); await interaction.response.send_message(embed=build_research_embed(),view=ResearchView(),ephemeral=True)
+
     @discord.ui.button(label="Ayuda", emoji="❓", style=discord.ButtonStyle.secondary, row=1)
     async def help(self,interaction,button):
         await interaction.response.send_message(embed=build_help_embed(),ephemeral=True)
 
+
+@bot.tree.command(name="mapa",description="Mapa de predicciones frente a sus sismos CSN más cercanos")
+@app_commands.describe(ia="IA/grupo opcional; vacío = todas")
+async def c_mapa(i:discord.Interaction,ia:str=""):
+    await i.response.defer(ephemeral=True)
+    group=ia.strip() or None
+    if group and group not in _prediction_groups():
+        await i.followup.send(f"❌ No encontré el grupo/IA `{group}`.",ephemeral=True); return
+    data,n=build_prediction_map(group)
+    if not data:
+        await i.followup.send("Todavía no hay suficientes predicciones y eventos CSN para construir el mapa.",ephemeral=True); return
+    title=f"🗺️ Mapa · {group}" if group else "🗺️ Mapa · todas las IAs"
+    e=ui_embed(title,f"**{n}** predicciones comparadas con su mejor candidato CSN.\n🔴 Predicción · 🔵 Sismo CSN · línea = separación geográfica")
+    e.set_image(url="attachment://mapa_predicciones.png")
+    await i.followup.send(embed=e,file=discord.File(BytesIO(data),filename="mapa_predicciones.png"),ephemeral=True)
+
+@bot.tree.command(name="evolucion",description="Muestra cómo ha cambiado el ranking desde esta actualización")
+async def c_evolucion(i:discord.Interaction):
+    save_ranking_snapshot(); await i.response.send_message(embed=build_evolution_embed(),ephemeral=True)
+
+class ResearchView(discord.ui.View):
+    def __init__(self): super().__init__(timeout=900)
+    @discord.ui.button(label="Ranking",emoji="🏆",style=discord.ButtonStyle.primary,row=0)
+    async def ranking(self,interaction,button): await interaction.response.send_message(embed=build_ranking_embed(),ephemeral=True)
+    @discord.ui.button(label="Comparar IAs",emoji="⚔️",style=discord.ButtonStyle.success,row=0)
+    async def compare(self,interaction,button):
+        if len(_prediction_groups())<2: await interaction.response.send_message("Necesito al menos dos IAs/grupos.",ephemeral=True); return
+        v=AICompareView(); await interaction.response.send_message(embed=build_comparison_embed(v.a,v.b),view=v,ephemeral=True)
+    @discord.ui.button(label="Mapa",emoji="🗺️",style=discord.ButtonStyle.secondary,row=0)
+    async def map(self,interaction,button):
+        await interaction.response.defer(ephemeral=True); data,n=build_prediction_map()
+        if not data: await interaction.followup.send("No hay suficientes datos para el mapa.",ephemeral=True); return
+        e=ui_embed("🗺️ Predicción vs realidad",f"**{n}** pares · 🔴 predicción · 🔵 CSN"); e.set_image(url="attachment://mapa_predicciones.png")
+        await interaction.followup.send(embed=e,file=discord.File(BytesIO(data),filename="mapa_predicciones.png"),ephemeral=True)
+    @discord.ui.button(label="Evolución",emoji="📈",style=discord.ButtonStyle.secondary,row=1)
+    async def evolution(self,interaction,button): save_ranking_snapshot(); await interaction.response.send_message(embed=build_evolution_embed(),ephemeral=True)
+    @discord.ui.button(label="Actividad",emoji="📡",style=discord.ButtonStyle.secondary,row=1)
+    async def activity(self,interaction,button): await interaction.response.send_message(embed=build_activity_embed(),ephemeral=True)
+
+@bot.tree.command(name="investigacion",description="Abre la vista de resultados para el proyecto de investigación")
+async def c_investigacion(i:discord.Interaction):
+    save_ranking_snapshot(); await i.response.send_message(embed=build_research_embed(),view=ResearchView(),ephemeral=True)
 
 @bot.tree.command(name="panel",description="Abre el centro de control visual del Bot Sísmico")
 async def c_panel(i:discord.Interaction):
