@@ -1220,78 +1220,93 @@ async def c_an_all(i:discord.Interaction):
         lines.append(f"**{group}** → {score} · 🟠 {almost} casi · 🔴 {misses} no acertadas · 🟡 {pending} pendientes")
     await i.response.send_message("\n".join(lines)[:1950])
 
-@bot.tree.command(name="ver_real",description="Detalle y enlace CSN de una predicción real")
+def _real_candidate_score(p, x, rad):
+    e=x["e"]
+    center=(p["mag_min"]+p["mag_max"])/2
+    distance_penalty=x["dist"]/max(rad,1)
+    mag_half=max((p["mag_max"]-p["mag_min"])/2,0.25)
+    mag_penalty=abs(e["magnitude"]-center)/mag_half
+    time_penalty=0 if x["t"] else 5
+    return time_penalty + distance_penalty + mag_penalty
+
+def _real_browser_data(p):
+    es=events()
+    st,b,rad,cands=evaluate_real(p,es)
+    # Mantener primero los eventos temporalmente compatibles; dentro de cada grupo,
+    # ordenar por proximidad combinada para que el navegador empiece por lo relevante.
+    cands=sorted(cands,key=lambda x:(0 if x["t"] else 1,_real_candidate_score(p,x,rad)))
+    initial=0
+    if b is not None and cands:
+        source_id=b["e"]["source_id"]
+        initial=next((n for n,x in enumerate(cands) if x["e"]["source_id"]==source_id),0)
+    return st,rad,cands,initial
+
+def build_real_browser_embed(p, st, rad, cands, index=0):
+    colors={"ACERTADA":discord.Color.green(),"CASI ACERTADA":discord.Color.gold(),
+            "NO ACERTADA":discord.Color.red(),"PENDIENTE":discord.Color.blurple()}
+    icons={"ACERTADA":"✅","CASI ACERTADA":"🟠","NO ACERTADA":"❌","PENDIENTE":"🟡"}
+    e=ui_embed(f"{icons.get(st,'🎯')} {p['code']} · {st}",
+               f"**{p['group_name']}** · Predicción #{p['prediction_no']}",colors.get(st,discord.Color.blurple()))
+    timeband=f"\nHorario diario: **{p['daily_time_start']}–{p['daily_time_end']}**" if p["daily_time_start"] else ""
+    e.add_field(name="🎯 Predicción",value=(
+        f"📅 **{p['date_start']} → {p['date_end']}**{timeband}\n"
+        f"📍 {p['place']}\n📈 **M{p['mag_min']:.1f}–M{p['mag_max']:.1f}** · 📏 **{rad} km**"),inline=False)
+    if not cands:
+        e.add_field(name="🌎 Comparación CSN",value="No hay sismos CSN guardados para comparar.",inline=False)
+        e.set_footer(text="Sismología Lab · /ver_real")
+        return e
+    index=max(0,min(index,len(cands)-1)); x=cands[index]; ev=x["e"]
+    try: when=parse_datetime(ev["occurred_at"]).strftime("%d/%m/%Y %H:%M:%S")
+    except Exception: when=str(ev["occurred_at"])
+    checks=f"🕒 {'✅' if x['t'] else '❌'}  ·  📈 {'✅' if x['m'] else '❌'}  ·  📍 {'✅' if x['g'] else '❌'}"
+    e.add_field(name=f"🌎 Sismo {index+1}/{len(cands)} · M{ev['magnitude']:.1f}",value=(
+        f"📅 {when}\n📍 {ev['place'] or 'Sin referencia geográfica'}\n"
+        f"🌐 `{ev['latitude']:.4f}, {ev['longitude']:.4f}`\n📏 **{x['dist']:.1f} km** de la predicción\n\n{checks}"),inline=False)
+    if ev["source_url"]:
+        e.add_field(name="🔗 CSN",value=f"[Abrir informe oficial]({ev['source_url']})",inline=False)
+    e.set_footer(text="◀️/▶️ recorre los sismos · ⭐ vuelve al más relevante")
+    return e
+
+class RealPredictionBrowser(discord.ui.View):
+    def __init__(self,p,st,rad,cands,index=0):
+        super().__init__(timeout=900)
+        self.p=p; self.st=st; self.rad=rad; self.cands=cands; self.index=index
+        self._sync()
+    def _sync(self):
+        disabled=len(self.cands)<=1
+        self.previous.disabled=disabled
+        self.next.disabled=disabled
+        self.best.disabled=not self.cands
+    async def _render(self,interaction):
+        self._sync()
+        await interaction.response.edit_message(embed=build_real_browser_embed(self.p,self.st,self.rad,self.cands,self.index),view=self)
+    @discord.ui.button(label="Anterior",emoji="◀️",style=discord.ButtonStyle.secondary,row=0)
+    async def previous(self,interaction,button):
+        if self.cands:self.index=(self.index-1)%len(self.cands)
+        await self._render(interaction)
+    @discord.ui.button(label="Siguiente",emoji="▶️",style=discord.ButtonStyle.primary,row=0)
+    async def next(self,interaction,button):
+        if self.cands:self.index=(self.index+1)%len(self.cands)
+        await self._render(interaction)
+    @discord.ui.button(label="Más relevante",emoji="⭐",style=discord.ButtonStyle.success,row=0)
+    async def best(self,interaction,button):
+        if self.cands:self.index=min(range(len(self.cands)),key=lambda n:_real_candidate_score(self.p,self.cands[n],self.rad))
+        await self._render(interaction)
+    @discord.ui.button(label="Cerrar",emoji="✖️",style=discord.ButtonStyle.secondary,row=1)
+    async def close(self,interaction,button):
+        for child in self.children: child.disabled=True
+        await interaction.response.edit_message(view=self)
+
+@bot.tree.command(name="ver_real",description="Explora una predicción real y sus sismos CSN en un menú interactivo")
 async def c_ver_real(i:discord.Interaction,codigo:str):
     with connect() as con:
-        p=con.execute(
-            "SELECT * FROM real_predictions WHERE UPPER(code)=UPPER(?)",
-            (codigo,)
-        ).fetchone()
-
+        p=con.execute("SELECT * FROM real_predictions WHERE UPPER(code)=UPPER(?)",(codigo,)).fetchone()
     if not p:
-        await i.response.send_message("❌ Predicción real no encontrada.")
+        await i.response.send_message("❌ Predicción real no encontrada.",ephemeral=True)
         return
-
-    es = events()
-    st,b,rad,cands = evaluate_real(p,es)
-    icon={"ACERTADA":"🟢","PENDIENTE":"🟡","NO ACERTADA":"🔴","CASI ACERTADA":"🟠"}[st]
-
-    timeband=""
-    if p["daily_time_start"]:
-        timeband=f" · horario diario {p['daily_time_start']}–{p['daily_time_end']}"
-
-    text=(
-        f"{icon} **{p['code']} — {st}**\n"
-        f"Grupo: **{p['group_name']}**\n"
-        f"📅 {p['date_start']} → {p['date_end']}{timeband}\n"
-        f"📍 {p['place']} ({p['latitude']:.4f}, {p['longitude']:.4f})\n"
-        f"📈 M{p['mag_min']:.1f}–M{p['mag_max']:.1f}\n"
-        f"📏 Radio usado: **{rad} km**"
-    )
-
-    chosen = b
-    chosen_title = "🌐 **SISMO COINCIDENTE DEL CSN**"
-
-    if chosen is None and cands:
-        # Elegir un candidato explicable:
-        # 1) preferir eventos dentro de la ventana temporal;
-        # 2) penalizar distancia fuera del radio y magnitud fuera del rango.
-        center=(p["mag_min"]+p["mag_max"])/2
-        temporal=[x for x in cands if x["t"]]
-        pool=temporal if temporal else cands
-
-        def score(x):
-            e=x["e"]
-            distance_penalty=x["dist"]/max(rad,1)
-            mag_half=max((p["mag_max"]-p["mag_min"])/2,0.25)
-            mag_penalty=abs(e["magnitude"]-center)/mag_half
-            # Si no está en tiempo y no había candidatos temporales, penalizarlo.
-            time_penalty=0 if x["t"] else 5
-            return time_penalty + distance_penalty + mag_penalty
-
-        chosen=min(pool,key=score)
-        chosen_title="🌐 **SISMO CSN MÁS APROXIMADO**"
-
-    if chosen:
-        e=chosen["e"]
-        when=parse_datetime(e["occurred_at"])
-        text+=(
-            f"\n\n{chosen_title}\n"
-            f"📅 {when:%d/%m/%Y %H:%M:%S}\n"
-            f"📈 M{e['magnitude']:.1f}\n"
-            f"📍 {e['place'] or 'Sin referencia geográfica'}\n"
-            f"🌎 {e['latitude']:.4f}, {e['longitude']:.4f}\n"
-            f"📏 Distancia: **{chosen['dist']:.1f} km**\n\n"
-            f"Tiempo: {'✅' if chosen['t'] else '❌'}\n"
-            f"Magnitud: {'✅' if chosen['m'] else '❌'}\n"
-            f"Ubicación: {'✅' if chosen['g'] else '❌'}"
-        )
-        if e["source_url"]:
-            text+=f"\n\n🔗 **Informe oficial CSN:**\n{e['source_url']}"
-    else:
-        text+="\n\nNo hay eventos CSN guardados para comparar."
-
-    await i.response.send_message(text[:1950])
+    st,rad,cands,initial=_real_browser_data(p)
+    await i.response.send_message(embed=build_real_browser_embed(p,st,rad,cands,initial),
+                                  view=RealPredictionBrowser(p,st,rad,cands,initial),ephemeral=True)
 
 
 
@@ -1356,41 +1371,9 @@ async def c_alert_off(i:discord.Interaction):
 
 
 
-@bot.tree.command(name="ranking",description="Ranking de aciertos cerrados por IA")
+@bot.tree.command(name="ranking",description="Ranking por aciertos, casi acertados y no acertados")
 async def c_ranking(i:discord.Interaction):
-    ps=get_real_group()
-    es=events()
-    groups={}
-    for p in ps: groups.setdefault(p["group_name"],[]).append(p)
-    rows=[]
-    for group,gps in groups.items():
-        hits=almost=misses=pending=0
-        for p in gps:
-            st,_,_,_=evaluate_real(p,es)
-            if st=="ACERTADA": hits+=1
-            elif st=="CASI ACERTADA": almost+=1
-            elif st=="NO ACERTADA": misses+=1
-            else: pending+=1
-        closed=hits+almost+misses
-        pct=(100*hits/closed) if closed else None
-        # Desempate: si dos IAs tienen la misma cantidad de aciertos,
-        # gana la que tenga mayor score promedio de proximidad en resultados cerrados.
-        group_scores=[]
-        for p in gps:
-            st,_,_,_=evaluate_real(p,es)
-            if st == "PENDIENTE":
-                continue
-            _, sc = best_proximity(p,es,DEFAULT_MARGIN_HOURS)
-            if sc:
-                group_scores.append(float(sc["score"]))
-        avg_score=(sum(group_scores)/len(group_scores)) if group_scores else 0.0
-        rows.append((hits,avg_score,pct if pct is not None else -1,group,almost,misses,closed,pending))
-    rows.sort(key=lambda r:(r[0],r[1],r[2]), reverse=True)
-    lines=["🏆 **RANKING DE PREDICCIONES**"]
-    for h,avg_score,pct,g,a,m,c,pend in rows:
-        result=f"{h}/{c} ({pct:.1f}%)" if c else "sin resultados cerrados"
-        lines.append(f"**{g}** → {result} · 🎯 Score {avg_score:.1f}% · ✅ {h} · 🟠 {a} · ❌ {m} · 🟡 {pend}")
-    await i.response.send_message("\n".join(lines)[:1950])
+    await i.response.send_message(embed=build_ranking_embed())
 
 @bot.tree.command(name="historial",description="Últimas correlaciones detectadas")
 async def c_history(i:discord.Interaction):
@@ -1801,12 +1784,9 @@ def build_status_embed():
     e.set_footer(text="CSN + predicciones • v1.2")
     return e
 
-def build_ranking_embed():
-    ps=get_real_group()
-    es=events()
-    groups={}
-    for p in ps:
-        groups.setdefault(p["group_name"],[]).append(p)
+def ranking_rows():
+    ps=get_real_group(); es=events(); groups={}
+    for p in ps: groups.setdefault(p["group_name"],[]).append(p)
     rows=[]
     for group,gps in groups.items():
         hits=almost=misses=pending=0
@@ -1816,32 +1796,26 @@ def build_ranking_embed():
             elif st=="CASI ACERTADA": almost+=1
             elif st=="NO ACERTADA": misses+=1
             else: pending+=1
-        closed=hits+almost+misses
-        pct=(100*hits/closed) if closed else None
-        group_scores=[]
-        for p in gps:
-            st,_,_,_=evaluate_real(p,es)
-            if st == "PENDIENTE":
-                continue
-            _, sc = best_proximity(p,es,DEFAULT_MARGIN_HOURS)
-            if sc:
-                group_scores.append(float(sc["score"]))
-        avg_score=(sum(group_scores)/len(group_scores)) if group_scores else 0.0
-        rows.append((hits,avg_score,pct if pct is not None else -1,group,almost,misses,pending))
-    rows.sort(key=lambda r:(r[0],r[1],r[2]), reverse=True)
-    e=ui_embed("🏆 Ranking por IA","Ordenado por aciertos; en empate, mayor score promedio de proximidad.")
+        # Prioridad solicitada: más aciertos > más casi > menos no acertados.
+        rows.append((group,hits,almost,misses,pending))
+    rows.sort(key=lambda r:(-r[1],-r[2],r[3],r[4],r[0].lower()))
+    return rows
+
+def build_ranking_embed():
+    rows=ranking_rows()
+    e=ui_embed("🏆 Ranking por IA","Prioridad: **✅ aciertos → 🟠 casi acertados → ❌ menos no acertados**. Las pendientes no deciden el puesto.")
     if not rows:
         e.description="Todavía no hay predicciones importadas."
         return e
     medals=["🥇","🥈","🥉"]
-    for idx,(h,avg_score,pct,g,a,m,pending) in enumerate(rows[:10]):
-        icon=medals[idx] if idx<3 else "▫️"
-        hit_pct=f"{pct:.1f}%" if pct>=0 else "—"
-        e.add_field(
-            name=f"{icon} {g} · {hit_pct} · 🎯 {avg_score:.1f}%",
-            value=f"✅ {h}  •  🟠 {a}  •  ❌ {m}  •  🟡 {pending}",
-            inline=False
-        )
+    for idx,(g,h,a,m,pending) in enumerate(rows[:10]):
+        icon=medals[idx] if idx<3 else f"**#{idx+1}**"
+        closed=h+a+m
+        exact_pct=(100*h/closed) if closed else 0
+        e.add_field(name=f"{icon} {g}",value=(
+            f"✅ **{h}** aciertos  ·  🟠 **{a}** casi  ·  ❌ **{m}** no acertados\n"
+            f"🟡 {pending} pendientes  ·  🎯 {exact_pct:.1f}% acierto exacto"),inline=False)
+    e.set_footer(text="Desempate: aciertos > casi > menos fallos")
     return e
 
 def build_history_embed():
@@ -2034,7 +2008,7 @@ class PredictionsPanel(discord.ui.View):
             if st=="ACERTADA": hit+=1
             elif st=="CASI ACERTADA": almost+=1
             elif st=="NO ACERTADA": miss+=1
-            elif st=="PENDIENTE": pending+=1
+            else: pending+=1
         e=ui_embed("🎯 Predicciones")
         e.add_field(name="Total",value=f"**{len(ps)}**",inline=True)
         e.add_field(name="✅ Acertadas",value=f"**{hit}**",inline=True)
@@ -2066,28 +2040,49 @@ class PredictionsPanel(discord.ui.View):
         e.add_field(name="🧊 Sin congelar",value=str(unfrozen),inline=True)
         await interaction.response.send_message(embed=e,ephemeral=True)
 
+def build_csn_browser_embed(es,index=0):
+    e=ui_embed("🌎 Explorador CSN","Navega por los sismos guardados sin llenar el canal de mensajes.")
+    if not es:
+        e.description="No hay eventos CSN guardados todavía."
+        return e
+    index=max(0,min(index,len(es)-1)); x=es[index]
+    try: when=parse_datetime(x["occurred_at"]).strftime("%d/%m/%Y %H:%M:%S")
+    except Exception: when=str(x["occurred_at"])
+    e.add_field(name=f"🌎 Sismo {index+1}/{len(es)} · M{x['magnitude']:.1f}",value=(
+        f"📅 **{when}**\n📍 {x['place'] or 'Sin referencia geográfica'}\n"
+        f"🌐 `{x['latitude']:.4f}, {x['longitude']:.4f}`\n"
+        f"⬇️ Profundidad: **{x['depth_km']:.1f} km**" if x['depth_km'] is not None else
+        f"📅 **{when}**\n📍 {x['place'] or 'Sin referencia geográfica'}\n🌐 `{x['latitude']:.4f}, {x['longitude']:.4f}`"),inline=False)
+    if x["source_url"]: e.add_field(name="🔗 Fuente",value=f"[Abrir informe oficial CSN]({x['source_url']})",inline=False)
+    e.set_footer(text="◀️/▶️ para navegar · 🔄 para volver al más reciente")
+    return e
+
+class CSNBrowser(discord.ui.View):
+    def __init__(self,es,index=0):
+        super().__init__(timeout=900); self.es=es; self.index=index
+        disabled=len(es)<=1; self.previous.disabled=disabled; self.next.disabled=disabled
+    async def _render(self,interaction):
+        await interaction.response.edit_message(embed=build_csn_browser_embed(self.es,self.index),view=self)
+    @discord.ui.button(label="Anterior",emoji="◀️",style=discord.ButtonStyle.secondary)
+    async def previous(self,interaction,button):
+        if self.es:self.index=(self.index-1)%len(self.es)
+        await self._render(interaction)
+    @discord.ui.button(label="Siguiente",emoji="▶️",style=discord.ButtonStyle.primary)
+    async def next(self,interaction,button):
+        if self.es:self.index=(self.index+1)%len(self.es)
+        await self._render(interaction)
+    @discord.ui.button(label="Más reciente",emoji="🔄",style=discord.ButtonStyle.success)
+    async def newest(self,interaction,button):
+        self.index=0; await self._render(interaction)
+
 class CSNPanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=900)
 
-    @discord.ui.button(label="Últimos sismos", emoji="🌎", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="Explorar sismos", emoji="🌎", style=discord.ButtonStyle.primary, row=0)
     async def latest(self, interaction, button):
-        es=events()[:8]
-        e=ui_embed("🌎 Últimos sismos guardados")
-        if not es:
-            e.description="No hay eventos CSN guardados todavía."
-        for x in es:
-            try:
-                when=parse_datetime(x["occurred_at"])
-                when_txt=when.strftime("%d/%m/%Y %H:%M:%S")
-            except Exception:
-                when_txt=str(x["occurred_at"])
-            e.add_field(
-                name=f"M{x['magnitude']:.1f} · {when_txt}",
-                value=f"📍 {x['place']}\n📐 {x['latitude']:.3f}, {x['longitude']:.3f}",
-                inline=False
-            )
-        await interaction.response.send_message(embed=e,ephemeral=True)
+        es=events()
+        await interaction.response.send_message(embed=build_csn_browser_embed(es,0),view=CSNBrowser(es,0),ephemeral=True)
 
     @discord.ui.button(label="Actualizar ahora", emoji="🔄", style=discord.ButtonStyle.success, row=0)
     async def update_now(self, interaction, button):
@@ -2243,7 +2238,7 @@ async def c_panel(i:discord.Interaction):
     e.add_field(name="📑 Correlaciones",value=f"**{n_corr}**",inline=True)
     e.add_field(name="🔔 Alertas",value=("Configuradas" if channel_id else "Sin canal"),inline=True)
     e.add_field(name="📡 Monitor",value=f"Cada **{CHECK_MINUTES} min**",inline=True)
-    e.set_footer(text="Panel v1.5.7 • Sismologia Lab")
+    e.set_footer(text="UI/QoL Update • Sismologia Lab")
     await i.response.send_message(embed=e,view=MainPanel())
 
 @bot.tree.command(name="ayuda",description="Muestra una guía limpia de los comandos del bot")
