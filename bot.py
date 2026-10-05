@@ -1818,6 +1818,90 @@ def build_ranking_embed():
     e.set_footer(text="Desempate: aciertos > casi > menos fallos")
     return e
 
+
+
+def _status_icon(st):
+    return {"ACERTADA":"✅","CASI ACERTADA":"🟠","NO ACERTADA":"❌","PENDIENTE":"🟡"}.get(st,"🎯")
+
+def _group_analysis(group):
+    ps=get_real_group(group); es=events()
+    out={"total":len(ps),"hits":0,"almost":0,"misses":0,"pending":0,"finalized":0,
+         "distances":[],"mag_errors":[],"time_errors":[],"time_ok":0,"mag_ok":0,"geo_ok":0,"evaluated":0}
+    for pred in ps:
+        st,b,rad,cands=evaluate_real(pred,es)
+        if st=="ACERTADA": out["hits"]+=1
+        elif st=="CASI ACERTADA": out["almost"]+=1
+        elif st=="NO ACERTADA": out["misses"]+=1
+        else: out["pending"]+=1
+        if st!="PENDIENTE": out["finalized"]+=1
+        ev,score=best_proximity(pred,es)
+        if ev is not None and score is not None:
+            out["evaluated"]+=1; out["distances"].append(float(score["distance_km"])); out["time_errors"].append(float(score["time_error_hours"]))
+            mag=float(ev["magnitude"]); lo=float(pred["mag_min"]); hi=float(pred["mag_max"])
+            out["mag_errors"].append(0.0 if lo<=mag<=hi else min(abs(mag-lo),abs(mag-hi)))
+            when=parse_datetime(ev["occurred_at"]); out["time_ok"]+=int(real_time_ok(when,pred)); out["mag_ok"]+=int(lo<=mag<=hi)
+            out["geo_ok"]+=int(float(score["distance_km"])<=float(score["radius_km"]))
+    return out
+
+def build_ai_profile_embed(group):
+    a=_group_analysis(group); rows=ranking_rows(); pos=next((i+1 for i,r in enumerate(rows) if r[0]==group),None)
+    closed=a["finalized"]; exact=100*a["hits"]/closed if closed else 0
+    e=ui_embed(f"🤖 Perfil · {group}",f"{'🏆 Puesto **#'+str(pos)+'**' if pos else 'Sin puesto todavía'} · muestra: **{closed} finalizadas** de {a['total']}")
+    e.add_field(name="📊 Resultados",value=f"✅ **{a['hits']}** · 🟠 **{a['almost']}** · ❌ **{a['misses']}** · 🟡 **{a['pending']}**\n🎯 Acierto exacto: **{exact:.1f}%**",inline=False)
+    if a["evaluated"]:
+        avg=lambda xs: sum(xs)/len(xs) if xs else 0
+        n=a["evaluated"]
+        e.add_field(name="🔬 Precisión descriptiva",value=(f"📍 Distancia media al mejor candidato: **{avg(a['distances']):.1f} km**\n"
+            f"📈 Error medio fuera del rango: **{avg(a['mag_errors']):.2f} M**\n🕒 Error temporal medio fuera de ventana: **{avg(a['time_errors']):.2f} h**"),inline=False)
+        e.add_field(name="🧩 Cumplimiento del mejor candidato",value=f"🕒 Tiempo **{100*a['time_ok']/n:.1f}%** · 📈 Magnitud **{100*a['mag_ok']/n:.1f}%** · 📍 Ubicación **{100*a['geo_ok']/n:.1f}%**",inline=False)
+    e.set_footer(text="Las métricas descriptivas usan el mejor candidato CSN disponible para cada predicción.")
+    return e
+
+def build_comparison_embed(a_name,b_name):
+    a=_group_analysis(a_name); b=_group_analysis(b_name)
+    e=ui_embed(f"⚔️ {a_name} vs {b_name}","Comparación directa. El ranking oficial sigue priorizando aciertos → casi → menos fallos.")
+    def line(x):
+        closed=x['finalized']; pct=100*x['hits']/closed if closed else 0
+        return f"✅ **{x['hits']}** · 🟠 **{x['almost']}** · ❌ **{x['misses']}** · 🟡 {x['pending']}\n🎯 {pct:.1f}% exacto · 🧪 **{closed}** finalizadas"
+    e.add_field(name=f"🤖 {a_name}",value=line(a),inline=True); e.add_field(name=f"🤖 {b_name}",value=line(b),inline=True)
+    def av(x,k): return sum(x[k])/len(x[k]) if x[k] else 0
+    if a['evaluated'] and b['evaluated']:
+        e.add_field(name="🔬 Errores medios",value=(f"📍 Distancia: **{av(a,'distances'):.1f}** vs **{av(b,'distances'):.1f} km**\n"
+            f"📈 Magnitud: **{av(a,'mag_errors'):.2f}** vs **{av(b,'mag_errors'):.2f} M**\n"
+            f"🕒 Tiempo: **{av(a,'time_errors'):.2f}** vs **{av(b,'time_errors'):.2f} h**"),inline=False)
+    return e
+
+def build_error_embed(pred):
+    es=events(); st,b,rad,cands=evaluate_real(pred,es); ev,score=best_proximity(pred,es)
+    e=ui_embed(f"🎯 Qué tan cerca estuvo · {pred['code']}",f"{_status_icon(st)} Resultado actual: **{st}**")
+    if ev is None or score is None:
+        e.description += "\n\nTodavía no hay un evento CSN disponible para comparar."; return e
+    mag=float(ev['magnitude']); lo=float(pred['mag_min']); hi=float(pred['mag_max']); mag_out=0 if lo<=mag<=hi else min(abs(mag-lo),abs(mag-hi))
+    dist=float(score['distance_km']); radius_km=float(score['radius_km']); geo_out=max(0,dist-radius_km); time_out=float(score['time_error_hours'])
+    e.add_field(name="📍 Ubicación",value=f"Distancia **{dist:.1f} km** / radio **{radius_km:.1f} km**\n{'✅ Dentro del radio' if geo_out==0 else f'❌ {geo_out:.1f} km fuera del radio'}",inline=False)
+    e.add_field(name="📈 Magnitud",value=f"CSN **M{mag:.1f}** / esperado **M{lo:.1f}–M{hi:.1f}**\n{'✅ Dentro del rango' if mag_out==0 else f'❌ {mag_out:.2f} M fuera del rango'}",inline=False)
+    e.add_field(name="🕒 Tiempo",value=('✅ Dentro de la ventana' if time_out==0 else f'❌ **{time_out:.2f} h** fuera de la ventana'),inline=False)
+    e.add_field(name="📊 Proximidad",value=f"Score descriptivo **{score['score']:.1f}%** · espacial {score['spatial_pct']:.1f}% · magnitud {score['magnitude_pct']:.1f}% · temporal {score['temporal_pct']:.1f}%",inline=False)
+    return e
+
+def build_activity_embed():
+    ps=get_real_group(); es=events(); finished=[]; active=[]
+    for pred in ps:
+        st,b,rad,c=evaluate_real(pred,es)
+        (active if st=='PENDIENTE' else finished).append((pred,st,b))
+    e=ui_embed("📡 Centro de actividad","Lo más importante que está ocurriendo en el experimento.")
+    e.add_field(name="🎯 Predicciones",value=f"🟡 **{len(active)}** activas · 🧾 **{len(finished)}** finalizadas",inline=False)
+    if es:
+        x=es[0]; e.add_field(name="🌎 Último sismo CSN",value=f"**M{x['magnitude']:.1f}** · {x['place'] or 'Sin referencia'}\n🕒 {str(x['occurred_at']).replace('T',' ')[:19]}",inline=False)
+    if active:
+        upcoming=sorted(active,key=lambda z:_window_bounds(z[0])[1])[:3]
+        e.add_field(name="⏳ Próximas en finalizar",value="\n".join(f"• **{x[0]['code']}** · {_window_bounds(x[0])[1]:%d/%m %H:%M}" for x in upcoming),inline=False)
+    recent=[x for x in finished if x[1] in ('ACERTADA','CASI ACERTADA') and x[2] is not None]
+    if recent:
+        recent.sort(key=lambda z:parse_datetime(z[2]['e']['occurred_at']),reverse=True); pred,st,b=recent[0]
+        e.add_field(name="✨ Último resultado destacado",value=f"{_status_icon(st)} **{pred['code']}** · {st}\n🌎 M{b['e']['magnitude']:.1f} · {b['e']['place'] or 'Sin referencia'}",inline=False)
+    return e
+
 def build_history_embed():
     with connect() as con:
         rows=con.execute("""SELECT * FROM correlation_history
@@ -1994,9 +2078,137 @@ class CalculatorView(discord.ui.View):
     async def compare(self,interaction,button):
         await interaction.response.send_modal(FullCompareModal())
 
+def _prediction_groups():
+    ps=get_real_group()
+    groups={}
+    for p in ps:
+        groups.setdefault(p["group_name"],[]).append(p)
+    return groups
+
+def _prediction_status_details(p):
+    es=events()
+    st,b,rad,cands=evaluate_real(p,es)
+    return st,b,rad,cands
+
+def build_prediction_explorer_embed(group, predictions, index=0):
+    if not predictions:
+        return ui_embed("🎯 Explorador de predicciones","No hay predicciones importadas para mostrar.")
+    index=max(0,min(index,len(predictions)-1)); p=predictions[index]
+    st,b,rad,cands=_prediction_status_details(p)
+    colors={"ACERTADA":discord.Color.green(),"CASI ACERTADA":discord.Color.gold(),
+            "NO ACERTADA":discord.Color.red(),"PENDIENTE":discord.Color.blurple()}
+    icons={"ACERTADA":"✅","CASI ACERTADA":"🟠","NO ACERTADA":"❌","PENDIENTE":"🟡"}
+    e=ui_embed(f"🔮 {group} · Predicción {index+1}/{len(predictions)}",
+               f"**{p['code']}**\n{icons.get(st,'🎯')} **{st}**",colors.get(st,discord.Color.blurple()))
+    schedule=f"📅 **{p['date_start']} → {p['date_end']}**"
+    if p["daily_time_start"]:
+        schedule+=f"\n🕐 **{p['daily_time_start']} → {p['daily_time_end']}**"
+    e.add_field(name="🗓️ Ventana temporal",value=schedule,inline=False)
+    e.add_field(name="📍 Ubicación predicha",value=(
+        f"**{p['place']}**\n🌐 `{p['latitude']:.4f}, {p['longitude']:.4f}`\n"
+        f"🧭 {p['zone_type'] or 'Zona no especificada'} · 📏 radio **{rad} km**"),inline=False)
+    e.add_field(name="📈 Magnitud",value=f"**M{p['mag_min']:.1f} – M{p['mag_max']:.1f}**",inline=True)
+    if p["geo_note"]:
+        note=str(p["geo_note"])
+        e.add_field(name="📝 Nota geográfica",value=note[:1000],inline=False)
+    if b is not None:
+        x=b; ev=x["e"]
+        try: when=parse_datetime(ev["occurred_at"]).strftime("%d/%m/%Y %H:%M:%S")
+        except Exception: when=str(ev["occurred_at"])
+        checks=f"🕒 {'✅' if x['t'] else '❌'}  ·  📈 {'✅' if x['m'] else '❌'}  ·  📍 {'✅' if x['g'] else '❌'}"
+        result=(f"🌎 **M{ev['magnitude']:.1f}** · {when}\n📍 {ev['place'] or 'Sin referencia'}\n"
+                f"📏 **{x['dist']:.1f} km** de la ubicación predicha\n{checks}")
+        if ev["source_url"]: result+=f"\n🔗 [Informe oficial CSN]({ev['source_url']})"
+        e.add_field(name="🌎 Sismo más relevante",value=result,inline=False)
+    elif st=="PENDIENTE":
+        e.add_field(name="⏳ Evaluación",value="La ventana todavía está abierta. El resultado final aún no se cierra.",inline=False)
+    else:
+        e.add_field(name="🌎 Evaluación",value="No se encontró un sismo candidato para mostrar como resultado.",inline=False)
+    e.set_footer(text=f"IA: {group} · ◀️/▶️ cambia predicción · menú desplegable cambia IA")
+    return e
+
+class PredictionGroupSelect(discord.ui.Select):
+    def __init__(self,browser,groups):
+        self.browser=browser
+        options=[discord.SelectOption(label=name[:100],value=name,description=f"{len(ps)} predicciones",default=(name==browser.group)) for name,ps in list(groups.items())[:25]]
+        super().__init__(placeholder="🤖 Cambiar IA / grupo",min_values=1,max_values=1,options=options,row=2)
+    async def callback(self,interaction):
+        self.browser.group=self.values[0]; self.browser.index=0; self.browser.apply_filter(); self.browser.rebuild_components(); await self.browser.render(interaction)
+
+class PredictionFilterSelect(discord.ui.Select):
+    def __init__(self,browser):
+        self.browser=browser
+        opts=[("TODAS","Todas","📚"),("ACERTADA","Acertadas","✅"),("CASI ACERTADA","Casi acertadas","🟠"),("NO ACERTADA","No acertadas","❌"),("PENDIENTE","Pendientes","🟡")]
+        super().__init__(placeholder="🔍 Filtrar por estado",min_values=1,max_values=1,options=[discord.SelectOption(label=l,value=v,emoji=em,default=(browser.filter_status==v)) for v,l,em in opts],row=3)
+    async def callback(self,interaction):
+        self.browser.filter_status=self.values[0]; self.browser.index=0; self.browser.apply_filter(); self.browser.rebuild_components(); await self.browser.render(interaction)
+
+class PredictionExplorer(discord.ui.View):
+    def __init__(self,group=None,index=0):
+        super().__init__(timeout=900); self.groups=_prediction_groups(); self.group=group if group in self.groups else next(iter(self.groups),None); self.filter_status="TODAS"; self.predictions=[]; self.index=index; self.apply_filter(); self.rebuild_components()
+    def apply_filter(self):
+        base=self.groups.get(self.group,[])
+        if self.filter_status=="TODAS": self.predictions=list(base)
+        else: self.predictions=[p for p in base if evaluate_real(p,events())[0]==self.filter_status]
+        self.index=max(0,min(self.index,len(self.predictions)-1)) if self.predictions else 0
+    def rebuild_components(self):
+        for child in list(self.children):
+            if isinstance(child,(PredictionGroupSelect,PredictionFilterSelect)): self.remove_item(child)
+        if self.groups:self.add_item(PredictionGroupSelect(self,self.groups)); self.add_item(PredictionFilterSelect(self)); self.sync_buttons()
+    def sync_buttons(self):
+        disabled=len(self.predictions)<=1; self.previous.disabled=disabled; self.next.disabled=disabled; self.details.disabled=not self.predictions; self.error.disabled=not self.predictions
+    async def render(self,interaction):
+        self.sync_buttons(); emb=build_prediction_explorer_embed(self.group,self.predictions,self.index)
+        if self.filter_status!="TODAS": emb.description=(emb.description or "")+f"\n🔍 Filtro: **{self.filter_status}**"
+        await interaction.response.edit_message(embed=emb,view=self)
+    @discord.ui.button(label="Anterior",emoji="◀️",style=discord.ButtonStyle.secondary,row=0)
+    async def previous(self,interaction,button):
+        if self.predictions:self.index=(self.index-1)%len(self.predictions)
+        await self.render(interaction)
+    @discord.ui.button(label="Siguiente",emoji="▶️",style=discord.ButtonStyle.primary,row=0)
+    async def next(self,interaction,button):
+        if self.predictions:self.index=(self.index+1)%len(self.predictions)
+        await self.render(interaction)
+    @discord.ui.button(label="Qué tan cerca",emoji="🎯",style=discord.ButtonStyle.secondary,row=0)
+    async def error(self,interaction,button):
+        await interaction.response.send_message(embed=build_error_embed(self.predictions[self.index]),ephemeral=True)
+    @discord.ui.button(label="Ver sismos",emoji="🌎",style=discord.ButtonStyle.success,row=0)
+    async def details(self,interaction,button):
+        if not self.predictions: await interaction.response.send_message("No hay predicciones para explorar.",ephemeral=True); return
+        p=self.predictions[self.index]; st,rad,cands,initial=_real_browser_data(p)
+        await interaction.response.send_message(embed=build_real_browser_embed(p,st,rad,cands,initial),view=RealPredictionBrowser(p,st,rad,cands,initial),ephemeral=True)
+    @discord.ui.button(label="Perfil IA",emoji="🤖",style=discord.ButtonStyle.secondary,row=1)
+    async def profile(self,interaction,button): await interaction.response.send_message(embed=build_ai_profile_embed(self.group),ephemeral=True)
+    @discord.ui.button(label="Cerrar",emoji="✖️",style=discord.ButtonStyle.secondary,row=1)
+    async def close(self,interaction,button):
+        for child in self.children: child.disabled=True
+        await interaction.response.edit_message(view=self)
+
+class CompareAISelect(discord.ui.Select):
+    def __init__(self,view,which,groups):
+        self.owner=view; self.which=which; current=view.a if which=='a' else view.b
+        super().__init__(placeholder=("🤖 IA A" if which=='a' else "🤖 IA B"),options=[discord.SelectOption(label=g,value=g,default=(g==current)) for g in groups[:25]],row=(0 if which=='a' else 1))
+    async def callback(self,interaction):
+        if self.which=='a': self.owner.a=self.values[0]
+        else:self.owner.b=self.values[0]
+        await interaction.response.edit_message(embed=build_comparison_embed(self.owner.a,self.owner.b),view=self.owner)
+
+class AICompareView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=900); groups=list(_prediction_groups()); self.a=groups[0]; self.b=groups[1] if len(groups)>1 else groups[0]; self.add_item(CompareAISelect(self,'a',groups)); self.add_item(CompareAISelect(self,'b',groups))
+
 class PredictionsPanel(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=900)
+
+    @discord.ui.button(label="Explorar", emoji="🔮", style=discord.ButtonStyle.success, row=0)
+    async def explore(self, interaction, button):
+        groups=_prediction_groups()
+        if not groups:
+            await interaction.response.send_message("No hay predicciones importadas. Usa `/importar_todos`.",ephemeral=True)
+            return
+        view=PredictionExplorer()
+        await interaction.response.send_message(embed=build_prediction_explorer_embed(view.group,view.predictions,view.index),view=view,ephemeral=True)
 
     @discord.ui.button(label="Resumen", emoji="🎯", style=discord.ButtonStyle.primary, row=0)
     async def summary(self, interaction, button):
@@ -2024,6 +2236,15 @@ class PredictionsPanel(discord.ui.View):
     @discord.ui.button(label="Historial", emoji="📑", style=discord.ButtonStyle.secondary, row=0)
     async def history(self, interaction, button):
         await interaction.response.send_message(embed=build_history_embed(),ephemeral=True)
+
+    @discord.ui.button(label="Comparar IAs", emoji="⚔️", style=discord.ButtonStyle.success, row=1)
+    async def compare_ai(self, interaction, button):
+        groups=list(_prediction_groups())
+        if len(groups)<2: await interaction.response.send_message("Necesito al menos dos IAs/grupos importados.",ephemeral=True); return
+        view=AICompareView(); await interaction.response.send_message(embed=build_comparison_embed(view.a,view.b),view=view,ephemeral=True)
+
+    @discord.ui.button(label="Actividad", emoji="📡", style=discord.ButtonStyle.secondary, row=1)
+    async def activity(self, interaction, button): await interaction.response.send_message(embed=build_activity_embed(),ephemeral=True)
 
     @discord.ui.button(label="Integridad", emoji="🔒", style=discord.ButtonStyle.secondary, row=1)
     async def integrity(self, interaction, button):
@@ -2171,7 +2392,7 @@ class MainPanel(discord.ui.View):
     @discord.ui.button(label="Predicciones", emoji="🎯", style=discord.ButtonStyle.primary, row=0)
     async def predictions(self,interaction,button):
         await interaction.response.send_message(
-            embed=ui_embed("🎯 Centro de predicciones","Resumen, ranking, historial e integridad."),
+            embed=ui_embed("🎯 Centro de predicciones","Explora predicciones por IA, revisa resultados, ranking, historial e integridad."),
             view=PredictionsPanel(),ephemeral=True)
 
     @discord.ui.button(label="Sismos CSN", emoji="🌎", style=discord.ButtonStyle.primary, row=0)
@@ -2215,6 +2436,10 @@ class MainPanel(discord.ui.View):
     @discord.ui.button(label="Historial", emoji="📑", style=discord.ButtonStyle.secondary, row=1)
     async def history(self,interaction,button):
         await interaction.response.send_message(embed=build_history_embed(),ephemeral=True)
+
+    @discord.ui.button(label="Actividad", emoji="📡", style=discord.ButtonStyle.success, row=2)
+    async def activity(self,interaction,button):
+        await interaction.response.send_message(embed=build_activity_embed(),ephemeral=True)
 
     @discord.ui.button(label="Ayuda", emoji="❓", style=discord.ButtonStyle.secondary, row=1)
     async def help(self,interaction,button):
