@@ -1541,51 +1541,75 @@ def build_experiment_pdf(output_path, group_name=None):
     story.append(rt)
     story.append(PageBreak())
 
-    story.append(Paragraph("Detalle de predicciones",h2))
-    detail=[["Codigo","IA","Ventana","Lugar","Magnitud","Radio","Estado","Sismo CSN relacionado"]]
-    for pred,st,b,rad,cands in results:
-        timeband=""
-        if pred["daily_time_start"] and pred["daily_time_end"]:
-            timeband=f" {pred['daily_time_start']}-{pred['daily_time_end']}"
-        window=f"{pred['date_start']} a {pred['date_end']}{timeband}"
-        related="-"
-        if b:
-            e=b["e"]; when=parse_datetime(e["occurred_at"])
-            related=f"{when:%d/%m %H:%M} | M{e['magnitude']:.1f} | {b['dist']:.1f} km | {e['place']}"
-        detail.append([
-            Paragraph(_pdf_safe(pred["code"]),small), Paragraph(_pdf_safe(pred["group_name"]),small),
-            Paragraph(_pdf_safe(window),small), Paragraph(_pdf_safe(pred["place"]),small),
-            f"M{pred['mag_min']:.1f}-{pred['mag_max']:.1f}", f"{rad:.0f} km", st,
-            Paragraph(_pdf_safe(related),small)
-        ])
-    if len(detail)==1:
-        detail.append(["-","-","-","No hay predicciones para este filtro","-","-","-","-"])
-    dt=Table(detail, colWidths=[25*mm,22*mm,39*mm,55*mm,27*mm,20*mm,27*mm,67*mm], repeatRows=1)
-    dt.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#111827")),("TEXTCOLOR",(0,0),(-1,0),colors.white),
-        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("VALIGN",(0,0),(-1,-1),"TOP"),
-        ("GRID",(0,0),(-1,-1),0.3,colors.HexColor("#c7c7c7")),("FONTSIZE",(0,0),(-1,-1),7.3),
-        ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#f8f8f8")]),
-        ("TEXTCOLOR",(6,1),(6,-1),colors.HexColor("#111111"))
-    ]))
-    story.append(dt)
+    # Detalle separado por estado para no mezclar ACERTADAS con CASI ACERTADAS.
+    status_sections = [
+        ("ACERTADA", "Predicciones ACERTADAS"),
+        ("CASI ACERTADA", "Predicciones CASI ACERTADAS"),
+        ("NO ACERTADA", "Predicciones NO ACERTADAS"),
+        ("PENDIENTE", "Predicciones PENDIENTES"),
+    ]
 
-    # Inspector section: one block per confirmed hit.
-    hits=[x for x in results if x[1] in ("ACERTADA", "CASI ACERTADA") and x[2]]
-    if hits:
+    def _prediction_detail_table(rows):
+        detail=[["Codigo","IA","Ventana","Lugar","Magnitud","Radio","Estado","Sismo CSN relacionado"]]
+        for pred,st,b,rad,cands in rows:
+            timeband=""
+            if pred["daily_time_start"] and pred["daily_time_end"]:
+                timeband=f" {pred['daily_time_start']}-{pred['daily_time_end']}"
+            window=f"{pred['date_start']} a {pred['date_end']}{timeband}"
+            related="-"
+            if b:
+                e=b["e"]; when=parse_datetime(e["occurred_at"])
+                related=f"{when:%d/%m %H:%M} | M{e['magnitude']:.1f} | {b['dist']:.1f} km | {e['place']}"
+            detail.append([
+                Paragraph(_pdf_safe(pred["code"]),small), Paragraph(_pdf_safe(pred["group_name"]),small),
+                Paragraph(_pdf_safe(window),small), Paragraph(_pdf_safe(pred["place"]),small),
+                f"M{pred['mag_min']:.1f}-{pred['mag_max']:.1f}", f"{rad:.0f} km", st,
+                Paragraph(_pdf_safe(related),small)
+            ])
+        dt=Table(detail, colWidths=[25*mm,22*mm,39*mm,55*mm,27*mm,20*mm,27*mm,67*mm], repeatRows=1)
+        dt.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#111827")),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+            ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("GRID",(0,0),(-1,-1),0.3,colors.HexColor("#c7c7c7")),("FONTSIZE",(0,0),(-1,-1),7.3),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#f8f8f8")]),
+            ("TEXTCOLOR",(6,1),(6,-1),colors.HexColor("#111111"))
+        ]))
+        return dt
+
+    story.append(Paragraph("Detalle de predicciones por resultado",h2))
+    for status, heading in status_sections:
+        rows=[x for x in results if x[1]==status]
+        story.append(Paragraph(f"{heading} ({len(rows)})", h2))
+        if rows:
+            story.append(_prediction_detail_table(rows))
+        else:
+            story.append(Paragraph("No hay predicciones en esta categoria.", body))
+        story.append(Spacer(1,4*mm))
+
+    # Inspectores separados: un acierto real no se mezcla con un casi acierto.
+    for wanted, heading in (("ACERTADA", "Inspector de ACERTADAS"),
+                            ("CASI ACERTADA", "Inspector de CASI ACERTADAS")):
+        rows=[x for x in results if x[1]==wanted and x[2]]
+        if not rows:
+            continue
         story.append(PageBreak())
-        story.append(Paragraph("Inspector de coincidencias acertadas y casi acertadas",h2))
+        story.append(Paragraph(heading,h2))
         inspect=[["Prediccion","Sismo CSN","Distancia","Magnitud","Tiempo","Ubicacion","Enlace"]]
-        for pred,st,b,rad,cands in hits:
+        for pred,st,b,rad,cands in rows:
             e=b["e"]; when=parse_datetime(e["occurred_at"])
             link=e["source_url"] or "-"
             inspect.append([
                 pred["code"], Paragraph(_pdf_safe(f"{when:%d/%m/%Y %H:%M} - M{e['magnitude']:.1f} - {e['place']}"),small),
-                f"{b['dist']:.1f}/{rad:.0f} km", "OK", "OK", "OK", Paragraph(_pdf_safe(link),small)
+                f"{b['dist']:.1f}/{rad:.0f} km",
+                "OK" if b.get("mag_ok") else "NO",
+                "OK" if b.get("time_ok") else "NO",
+                "OK" if b.get("geo_ok") else "NO",
+                Paragraph(_pdf_safe(link),small)
             ])
         it=Table(inspect,colWidths=[30*mm,85*mm,35*mm,25*mm,25*mm,25*mm,60*mm],repeatRows=1)
         it.setStyle(TableStyle([
-            ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#065f46")),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+            ("BACKGROUND",(0,0),(-1,0),colors.HexColor("#065f46") if wanted=="ACERTADA" else colors.HexColor("#92400e")),
+            ("TEXTCOLOR",(0,0),(-1,0),colors.white),
             ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("VALIGN",(0,0),(-1,-1),"TOP"),
             ("GRID",(0,0),(-1,-1),0.35,colors.HexColor("#b7b7b7")),("FONTSIZE",(0,0),(-1,-1),7.5)
         ]))
@@ -1597,7 +1621,7 @@ def build_experiment_pdf(output_path, group_name=None):
         canvas.drawRightString(landscape(A4)[0]-12*mm,6*mm,f"Pagina {doc.page}")
         canvas.restoreState()
     doc.build(story,onFirstPage=footer,onLaterPages=footer)
-    return {"predictions":len(ps),"hits":hit,"misses":miss,"pending":pending,"events":len(es)}
+    return {"predictions":len(ps),"hits":hit,"almost":almost,"misses":miss,"pending":pending,"events":len(es)}
 
 @bot.tree.command(name="informe_pdf",description="Genera un PDF con resultados del experimento")
 @app_commands.describe(ia="IA/grupo a incluir, o TODAS")
