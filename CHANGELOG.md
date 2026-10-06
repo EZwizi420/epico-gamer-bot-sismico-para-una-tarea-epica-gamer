@@ -32,9 +32,3 @@
 - Caducidad/evaluación de predicciones.
 - Score de proximidad, historial, integridad, backups y dashboard.
 - Exportación Excel e informe PDF.
-
-## 3.0.3 Hotfix — Gemini ± hour windows
-- Added support for Gemini date/time values such as `03/10/2026 08:30 ± 4 h`.
-- The central time is now expanded symmetrically (example: 08:30 ± 4 h = 04:30–12:30).
-- Windows that cross midnight correctly update both the start/end date and time.
-- Also accepts `+/-` and `+-`, plus `h`, `hr(s)` and `hora(s)` variants.

@@ -276,17 +276,22 @@ def parse_real_date_window(raw, year_default=2026):
     if m:
         d1,mo1,y1,t1,d2,mo2,y2,t2=m.groups()
         return check(make(d1,mo1,y1),make(d2,mo2,y2),t1,t2)
-    # One full local date/time with a symmetric +/- hour margin (GEMINI).
-    # Example: 03/10/2026 08:30 ± 4 h -> 03/10/2026 04:30 to 03/10/2026 12:30.
-    # The window may cross midnight, so date_start/date_end are adjusted too.
-    m=re.search(r"(\d{1,2})/(\d{1,2})/(20\d{2})\s+(\d{1,2}:\d{2})\s*(?:±|\+\s*/?\s*-|\+-)\s*(\d+(?:[.,]\d+)?)\s*(?:h|hr|hrs|hora|horas)\b",s)
+    # Gemini: fecha/hora central con margen simétrico, ej.
+    # "05/10/2026 11:20 ± 5 h" -> 05/10 06:20 .. 05/10 16:20.
+    # IMPORTANTE: esta regla debe ir antes de la fecha individual genérica.
+    m = re.search(
+        r"(\d{1,2})/(\d{1,2})/(20\d{2})\s+(\d{1,2}:\d{2})\s*"
+        r"(?:±|\+\s*/?\s*-|\+\s*-|\+/-)\s*(\d+(?:[.,]\d+)?)\s*(?:h|hr|hrs|hora|horas)\b",
+        s,
+    )
     if m:
-        d,mo,y,clock,hours=m.groups()
-        center=datetime.combine(make(d,mo,y),datetime.strptime(clock,"%H:%M").time())
-        margin=timedelta(hours=float(hours.replace(",",".")))
-        start=center-margin
-        end=center+margin
-        return check(start.date(),end.date(),start.strftime("%H:%M"),end.strftime("%H:%M"))
+        d, mo, y, clock, margin = m.groups()
+        margin_h = float(margin.replace(",", "."))
+        center = datetime.combine(make(d, mo, y), datetime.strptime(clock, "%H:%M").time())
+        start = center - timedelta(hours=margin_h)
+        end = center + timedelta(hours=margin_h)
+        return check(start.date(), end.date(), start.strftime("%H:%M"), end.strftime("%H:%M"))
+
     # One full date with UTC time and stated duration (GEMINI).
     m=re.search(r"(\d{1,2})/(\d{1,2})/(20\d{2})\s+(\d{1,2}:\d{2})\s+utc\s*\(\s*(\d+)\s*h\s*\)",s)
     if m:
@@ -856,6 +861,18 @@ async def on_ready():
     if not csn_loop.is_running():csn_loop.start()
     if not backup_loop.is_running():backup_loop.start()
     freeze_predictions()
+    # Re-sincroniza las predicciones reales desde el Excel al arrancar.
+    # El UPSERT de import_real_group actualiza también filas ya existentes en SQLite.
+    sync_total = 0
+    sync_errors = []
+    for _group in REAL_GROUPS:
+        _n, _skipped, _errs = import_real_group(_group)
+        sync_total += _n
+        if _errs:
+            sync_errors.extend(f"{_group}: {x}" for x in _errs[:1])
+    print(f"Excel -> SQLite: {sync_total} predicciones reales sincronizadas.")
+    if sync_errors:
+        print("Avisos de sincronización:", "; ".join(sync_errors[:5]))
     print(f"Conectado: {bot.user}. CSN cada {CHECK_MINUTES} min. Backup diario activo.")
 
 @bot.tree.command(name="importar_pruebas",description="Importa PRUEBA desde el Excel")
