@@ -1,4 +1,14 @@
 __pycache__/
 *.pyc
 .env
-bot_sismico.db
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+backups/
+.venv/
+venv/
+.DS_Store
