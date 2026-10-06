@@ -38,6 +38,24 @@ def parse_datetime(value):
         return datetime.fromisoformat(value)
     raise TypeError(f"fecha/hora inválida: {type(value).__name__}")
 
+def parse_user_date(value):
+    """Parsea fechas escritas por el usuario para /importar_historico.
+
+    Devuelve datetime.date porque el importador histórico trabaja por catálogos diarios.
+    Formato principal: DD/MM/AAAA. También acepta DD-MM-AAAA y AAAA-MM-DD.
+    """
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    raise ValueError("Fecha no reconocida. Usa DD/MM/AAAA (ej.: 01/10/2026).")
+
 def connect():
     con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row; return con
 
