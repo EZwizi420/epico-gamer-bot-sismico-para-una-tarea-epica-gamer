@@ -32,3 +32,8 @@
 - Caducidad/evaluación de predicciones.
 - Score de proximidad, historial, integridad, backups y dashboard.
 - Exportación Excel e informe PDF.
+
+## v3.0.7 - Evaluación CSN explicable
+- `/ver_real` y el explorador ya no ocultan el mejor evento cuando una predicción termina NO ACERTADA.
+- Prioriza eventos dentro de la ventana temporal y muestra qué criterio falló: tiempo, magnitud o distancia.
+- Confirma que los eventos de `/importar_historico` se guardan en `observed_events` y son leídos por el mismo `events()` usado por la evaluación.

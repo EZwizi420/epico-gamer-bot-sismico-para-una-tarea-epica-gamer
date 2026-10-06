@@ -22,7 +22,7 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 
 from csn import fetch_recent_events, fetch_recent_events_debug, fetch_historical_events
 from dashboard import run_dashboard
-from evaluator import evaluate_real as shared_evaluate_real, best_proximity, real_window_finished as shared_real_window_finished, real_time_ok as shared_real_time_ok, _window_bounds as shared_window_bounds
+from evaluator import evaluate_real as shared_evaluate_real, best_proximity, proximity_score, real_window_finished as shared_real_window_finished, real_time_ok as shared_real_time_ok, _window_bounds as shared_window_bounds
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 EXCEL_PATH = os.getenv("EXCEL_PATH", "Proyecto_Tabla_de_datos_con_coordenadas.xlsx")
@@ -2281,19 +2281,48 @@ def build_prediction_explorer_embed(group, predictions, index=0):
     if p["geo_note"]:
         note=str(p["geo_note"])
         e.add_field(name="📝 Nota geográfica",value=note[:1000],inline=False)
-    if b is not None:
-        x=b; ev=x["e"]
+    # Si no hubo ACERTADA/CASI, no ocultar los eventos históricos: mostrar el
+    # candidato más útil para explicar exactamente por qué falló la predicción.
+    display_x = b
+    display_score = None
+    if display_x is None and cands:
+        temporal = [x for x in cands if x["t"]]
+        pool = temporal if temporal else cands
+        ranked = []
+        for x in pool:
+            try:
+                sc = proximity_score(p, x["e"], DEFAULT_MARGIN_HOURS)
+                ranked.append((sc["score"], x, sc))
+            except Exception:
+                ranked.append((-1, x, None))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        if ranked:
+            _, display_x, display_score = ranked[0]
+
+    if display_x is not None:
+        x=display_x; ev=x["e"]
         try: when=parse_datetime(ev["occurred_at"]).strftime("%d/%m/%Y %H:%M:%S")
         except Exception: when=str(ev["occurred_at"])
         checks=f"🕒 {'✅' if x['t'] else '❌'}  ·  📈 {'✅' if x['m'] else '❌'}  ·  📍 {'✅' if x['g'] else '❌'}"
         result=(f"🌎 **M{ev['magnitude']:.1f}** · {when}\n📍 {ev['place'] or 'Sin referencia'}\n"
                 f"📏 **{x['dist']:.1f} km** de la ubicación predicha\n{checks}")
+        if display_score is not None:
+            result += f"\n🎯 Proximidad descriptiva: **{display_score['score']:.1f}%**"
+        failures=[]
+        if not x['t']: failures.append("fuera de la ventana temporal")
+        if not x['m']: failures.append(f"magnitud fuera de M{p['mag_min']:.1f}–M{p['mag_max']:.1f}")
+        if not x['g']: failures.append(f"distancia mayor al radio de {rad} km")
+        if failures:
+            result += "\n❌ No califica por: " + "; ".join(failures) + "."
         if ev["source_url"]: result+=f"\n🔗 [Informe oficial CSN]({ev['source_url']})"
-        e.add_field(name="🌎 Sismo más relevante",value=result,inline=False)
+        title = "🌎 Sismo más relevante" if b is not None else "🔎 Mejor candidato CSN encontrado"
+        e.add_field(name=title,value=result[:1024],inline=False)
+        if st=="PENDIENTE":
+            e.add_field(name="⏳ Evaluación",value="La ventana todavía está abierta. Este candidato es informativo; el resultado final aún no se cierra.",inline=False)
     elif st=="PENDIENTE":
-        e.add_field(name="⏳ Evaluación",value="La ventana todavía está abierta. El resultado final aún no se cierra.",inline=False)
+        e.add_field(name="⏳ Evaluación",value="La ventana todavía está abierta y aún no hay eventos CSN guardados para comparar.",inline=False)
     else:
-        e.add_field(name="🌎 Evaluación",value="No se encontró un sismo candidato para mostrar como resultado.",inline=False)
+        e.add_field(name="🌎 Evaluación",value="No hay eventos CSN guardados que puedan mostrarse como candidato. Revisa `/importar_historico` para ese período.",inline=False)
     e.set_footer(text=f"IA: {group} · ◀️/▶️ cambia predicción · menú desplegable cambia IA")
     return e
 
