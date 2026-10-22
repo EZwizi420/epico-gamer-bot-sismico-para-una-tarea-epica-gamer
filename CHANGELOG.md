@@ -1,3 +1,10 @@
+## Hotfix 3.0.9 — 2026-10-22
+- El botón **Ranking** confirma la interacción de Discord antes de ejecutar el cálculo; el cálculo se realiza en un hilo para evitar `10062 Unknown interaction`.
+- Añadido `/reconstruir_correlaciones`: sincroniza las predicciones del Excel, importa catálogos históricos CSN para ventanas de hasta 31 días y reconstruye el historial sin borrar registros ni enviar alertas masivas.
+- El mapa Leaflet utiliza una capa oscura CARTO y distingue visualmente aciertos, casi aciertos, pendientes y no acertados.
+- El dashboard clasifica correctamente `CASI ACERTADA`, la incluye en estadísticas y ranking, y `/health` informa el estado de la base de datos y sus conteos.
+- `EXCEL_PATH` relativo ahora busca también el archivo Excel junto a `bot.py` si Render inicia desde otro directorio.
+
 ## Hotfix 3.0.2 — 2026-10-05
 - Corregido `NameError: timezone is not defined` en **Actividad**.
 - Se conserva la normalización UTC añadida en 3.0.1.

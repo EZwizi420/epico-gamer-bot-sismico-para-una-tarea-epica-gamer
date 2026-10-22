@@ -95,3 +95,13 @@ SismoBot sirve para registrar y evaluar estimaciones experimentales frente a eve
 
 **SismoBot — Edición Definitiva (QoL v3)**  
 Consolidada: 5 de octubre de 2026.
+
+
+## Hotfix 3.0.9: ranking, correlaciones e interfaz Leaflet
+
+1. Despliega los archivos actualizados conservando las variables de entorno y el disco persistente.
+2. En Discord, ejecuta `/reconstruir_correlaciones`. El comando sincroniza las predicciones desde el Excel y, si las fechas abarcan como máximo 31 días, descarga esos catálogos históricos del CSN y reconstruye el historial de coincidencias sin eliminar registros.
+3. Si el rango supera 31 días, importa los catálogos con `/importar_historico` en bloques de hasta 31 días y vuelve a ejecutar `/reconstruir_correlaciones`.
+4. El mapa Leaflet usa una capa oscura. El endpoint `/health` informa los conteos de predicciones, eventos CSN y registros de correlación para ayudar a diagnosticar la base de datos activa.
+
+Nota: una correlación solo se registra si un evento CSN cumple al menos 2 de los 3 filtros actuales (tiempo, magnitud, ubicación). El código no fuerza coincidencias si los datos no cumplen los criterios.

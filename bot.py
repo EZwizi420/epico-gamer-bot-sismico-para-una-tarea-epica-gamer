@@ -26,6 +26,12 @@ from evaluator import evaluate_real as shared_evaluate_real, best_proximity, pro
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 EXCEL_PATH = os.getenv("EXCEL_PATH", "Proyecto_Tabla_de_datos_con_coordenadas.xlsx")
+# If Render starts the process from a different working directory, resolve the
+# bundled workbook relative to this file before declaring it missing.
+if not Path(EXCEL_PATH).is_absolute() and not Path(EXCEL_PATH).exists():
+    _bundled_excel = Path(__file__).resolve().parent / EXCEL_PATH
+    if _bundled_excel.exists():
+        EXCEL_PATH = str(_bundled_excel)
 DB_PATH = os.getenv("DB_PATH", "bot_sismico.db")
 CHECK_MINUTES = int(os.getenv("CSN_CHECK_MINUTES", "5"))
 DEFAULT_MARGIN_HOURS = 2
@@ -464,11 +470,35 @@ def integrity_status(p):
 
 def save_correlation_history(e,p,level,dist):
     with connect() as con:
+        before = con.total_changes
         con.execute("""INSERT OR IGNORE INTO correlation_history
           (event_source_id,prediction_code,match_level,detected_at,event_time,event_mag,event_place,distance_km,source_url)
           VALUES(?,?,?,?,?,?,?,?,?)""",
           (str(e["source_id"]),p["code"],level,datetime.now().isoformat(),e["occurred_at"],
            e["magnitude"],e["place"],dist,e["source_url"]))
+        return con.total_changes > before
+
+
+def rebuild_correlation_history():
+    """Backfill alert history from events already in SQLite; never deletes rows or sends alerts."""
+    ps = get_real_group()
+    es = events()
+    exact = almost = added = 0
+    for p in ps:
+        for e in es:
+            check = event_matches_real_prediction(e, p)
+            passed = sum((check["time"], check["mag"], check["geo"]))
+            if passed < 2:
+                continue
+            level = "COINCIDENCIA" if passed == 3 else "CASI"
+            if save_correlation_history(e, p, level, check["dist"]):
+                added += 1
+                if level == "COINCIDENCIA":
+                    exact += 1
+                else:
+                    almost += 1
+    return {"predictions": len(ps), "events": len(es), "added": added,
+            "exact_added": exact, "almost_added": almost}
 
 def backup_database():
     src=Path(DB_PATH)
@@ -1064,6 +1094,71 @@ async def c_history(
 
     except Exception as exc:
         await i.followup.send(f"❌ Error importando histórico CSN: `{exc}`")
+
+@bot.tree.command(
+    name="reconstruir_correlaciones",
+    description="Reevalúa predicciones contra eventos CSN guardados y recupera el historial"
+)
+async def c_rebuild_correlations(i: discord.Interaction):
+    await i.response.defer(ephemeral=True, thinking=True)
+    try:
+        # Make sure the current workbook is synced before evaluating.
+        imported = 0
+        errors = []
+        for group in REAL_GROUPS:
+            n, _skipped, errs = await __import__("asyncio").to_thread(import_real_group, group)
+            imported += n
+            if errs:
+                errors.extend(f"{group}: {err}" for err in errs[:1])
+
+        # Fetch CSN catalogues for the predictions' own dates when the total
+        # span is manageable. This is what lets expired predictions be evaluated
+        # against historical earthquakes instead of only today's recent feed.
+        history_imported = 0
+        history_errors = []
+        prediction_rows = get_real_group()
+        if prediction_rows:
+            history_start = min(date.fromisoformat(str(p["date_start"])) for p in prediction_rows)
+            history_end = max(date.fromisoformat(str(p["date_end"])) for p in prediction_rows)
+            history_days = (history_end - history_start).days + 1
+            if 0 < history_days <= 31:
+                historical, history_errors = await __import__("asyncio").to_thread(
+                    fetch_historical_events, history_start, history_end
+                )
+                for event in historical:
+                    history_imported += int(save_csn_event(event))
+            else:
+                history_errors.append(
+                    f"El período de predicciones abarca {history_days} días; por seguridad no se descargó automáticamente. Usa /importar_historico en bloques de hasta 31 días."
+                )
+
+        result = await __import__("asyncio").to_thread(rebuild_correlation_history)
+        msg = (
+            "🔄 **RECONSTRUCCIÓN DE CORRELACIONES COMPLETADA**\n"
+            f"Predicciones sincronizadas desde Excel: **{imported}**\n"
+            f"Eventos históricos nuevos descargados/guardados: **{history_imported}**\n"
+            f"Predicciones en SQLite: **{result['predictions']}**\n"
+            f"Eventos CSN guardados: **{result['events']}**\n"
+            f"Nuevas coincidencias 3/3: **{result['exact_added']}**\n"
+            f"Nuevas casi coincidencias 2/3: **{result['almost_added']}**\n"
+            f"Nuevos registros históricos: **{result['added']}**"
+        )
+        if result["predictions"] and not result["events"]:
+            msg += "\n\n⚠️ No hay eventos CSN guardados. Usa `/importar_historico` para importar las fechas de tus predicciones."
+        elif result["predictions"] and result["events"] and result["added"] == 0:
+            msg += "\n\nℹ️ No se encontraron pares nuevos de 2/3 o 3/3 filtros. Esto puede ser correcto si las fechas, magnitudes o ubicaciones no coinciden, o si falta importar el catálogo histórico de esas fechas."
+        if errors:
+            msg += "\nAvisos de Excel: " + "; ".join(errors[:3])
+        if history_errors:
+            msg += "\\nAvisos CSN histórico: " + "; ".join(history_errors[:2])
+        await i.followup.send(msg[:1900], ephemeral=True)
+    except Exception as exc:
+        print(f"Error reconstruyendo correlaciones: {type(exc).__name__}: {exc}")
+        await i.followup.send(
+            f"❌ No se pudieron reconstruir las correlaciones: `{type(exc).__name__}: {str(exc)[:250]}`",
+            ephemeral=True
+        )
+
 
 @bot.tree.command(
     name="ultimos_csn",
@@ -2454,7 +2549,18 @@ class PredictionsPanel(discord.ui.View):
 
     @discord.ui.button(label="Ranking", emoji="🏆", style=discord.ButtonStyle.secondary, row=0)
     async def ranking(self, interaction, button):
-        await interaction.response.send_message(embed=build_ranking_embed(),ephemeral=True)
+        # Acknowledge immediately so Discord's short interaction deadline is not
+        # exceeded while ranking_rows evaluates every prediction against CSN.
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            embed = await __import__("asyncio").to_thread(build_ranking_embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as exc:
+            print(f"Error generando ranking: {type(exc).__name__}: {exc}")
+            await interaction.followup.send(
+                "⚠️ No se pudo generar el ranking. Revisa los logs de Render.",
+                ephemeral=True
+            )
 
     @discord.ui.button(label="Historial", emoji="📑", style=discord.ButtonStyle.secondary, row=0)
     async def history(self, interaction, button):
@@ -2708,7 +2814,14 @@ async def c_evolucion(i:discord.Interaction):
 class ResearchView(discord.ui.View):
     def __init__(self): super().__init__(timeout=900)
     @discord.ui.button(label="Ranking",emoji="🏆",style=discord.ButtonStyle.primary,row=0)
-    async def ranking(self,interaction,button): await interaction.response.send_message(embed=build_ranking_embed(),ephemeral=True)
+    async def ranking(self, interaction, button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            embed = await __import__("asyncio").to_thread(build_ranking_embed)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as exc:
+            print(f"Error generando ranking de investigación: {type(exc).__name__}: {exc}")
+            await interaction.followup.send("⚠️ No se pudo generar el ranking.", ephemeral=True)
     @discord.ui.button(label="Comparar IAs",emoji="⚔️",style=discord.ButtonStyle.success,row=0)
     async def compare(self,interaction,button):
         if len(_prediction_groups())<2: await interaction.response.send_message("Necesito al menos dos IAs/grupos.",ephemeral=True); return
