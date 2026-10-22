@@ -10,7 +10,10 @@ def haversine(a,b,c,d):
     R=6371.0088; p1,p2=math.radians(a),math.radians(c)
     dp=math.radians(c-a); dl=math.radians(d-b)
     x=math.sin(dp/2)**2+math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
-    return R*2*math.atan2(math.sqrt(x),math.sqrt(1-x))
+    # Floating-point rounding can push x just outside [0, 1],
+    # making sqrt(1-x) raise a math domain error.
+    x=max(0.0, min(1.0, x))
+    return R*2*math.atan2(math.sqrt(x),math.sqrt(1.0-x))
 
 def radius(mag,zone=""):
     if mag<3.5:r=20
