@@ -33,6 +33,8 @@ if not Path(EXCEL_PATH).is_absolute() and not Path(EXCEL_PATH).exists():
     if _bundled_excel.exists():
         EXCEL_PATH = str(_bundled_excel)
 DB_PATH = os.getenv("DB_PATH", "bot_sismico.db")
+MAP_SYNC_URL = os.getenv("MAP_SYNC_URL", "").strip().rstrip("/")
+MAP_SYNC_TOKEN = os.getenv("MAP_SYNC_TOKEN", "").strip()
 CHECK_MINUTES = int(os.getenv("CSN_CHECK_MINUTES", "5"))
 DEFAULT_MARGIN_HOURS = 2
 BOT_STARTED_AT = pytime.monotonic()
@@ -64,6 +66,57 @@ def parse_user_date(value):
 
 def connect():
     con=sqlite3.connect(DB_PATH); con.row_factory=sqlite3.Row; return con
+
+
+
+def sync_database_snapshot_to_map():
+    """Push a consistent read-only snapshot to the separate public map service."""
+    if not MAP_SYNC_URL or not MAP_SYNC_TOKEN:
+        return False
+    snapshot_path = None
+    try:
+        with tempfile.NamedTemporaryFile(prefix="sismobot-map-", suffix=".db", delete=False) as tmp:
+            snapshot_path = tmp.name
+        source = sqlite3.connect(DB_PATH, timeout=20)
+        target = sqlite3.connect(snapshot_path, timeout=20)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+            source.close()
+        with open(snapshot_path, "rb") as snapshot:
+            response = requests.post(
+                MAP_SYNC_URL + "/api/sync-db",
+                headers={"Authorization": f"Bearer {MAP_SYNC_TOKEN}"},
+                files={"database": ("bot_sismico.db", snapshot, "application/octet-stream")},
+                timeout=45,
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise RuntimeError("El servicio del mapa rechazó la copia SQLite.")
+        print("Mapa: instantánea SQLite sincronizada correctamente.")
+        return True
+    except Exception as exc:
+        print(f"Mapa: sincronización pendiente ({type(exc).__name__}: {exc})")
+        return False
+    finally:
+        if snapshot_path and os.path.exists(snapshot_path):
+            try:
+                os.remove(snapshot_path)
+            except OSError:
+                pass
+
+
+def map_database_sync_loop():
+    """Sync immediately, then refresh the map snapshot once per minute."""
+    if not MAP_SYNC_URL or not MAP_SYNC_TOKEN:
+        print("Mapa: sincronización remota desactivada; configura MAP_SYNC_URL y MAP_SYNC_TOKEN.")
+        return
+    while True:
+        sync_database_snapshot_to_map()
+        pytime.sleep(60)
+
 
 def init_db():
     with connect() as con:
@@ -3029,5 +3082,8 @@ async def c_system_status(i:discord.Interaction):
     embed.set_footer(text="CPU se muestra como carga del sistema (1/5/15 min), no como porcentaje.")
     await i.response.send_message(embed=embed,ephemeral=True)
 
+
+if MAP_SYNC_URL and MAP_SYNC_TOKEN:
+    threading.Thread(target=map_database_sync_loop, daemon=True, name="sismobot-map-sync").start()
 
 bot.run(TOKEN)

@@ -105,3 +105,26 @@ Consolidada: 5 de octubre de 2026.
 4. El mapa Leaflet usa una capa oscura. El endpoint `/health` informa los conteos de predicciones, eventos CSN y registros de correlación para ayudar a diagnosticar la base de datos activa.
 
 Nota: una correlación solo se registra si un evento CSN cumple al menos 2 de los 3 filtros actuales (tiempo, magnitud, ubicación). El código no fuerza coincidencias si los datos no cumplen los criterios.
+
+
+## Render: bot y mapa en servicios separados (sin compartir el disco)
+
+El Background Worker conserva la base original en su volumen `/data`. El Web Service del mapa mantiene una copia SQLite sincronizada por HTTPS cada 60 segundos; **no comparte ni monta el disco del bot**.
+
+### Servicio original (Background Worker)
+
+- Conserva su disco actual montado en `/data` y `DB_PATH=/data/bot_sismico.db`.
+- Añade `MAP_SYNC_URL=https://TU-MAPA.onrender.com` (URL base del Web Service del mapa, sin `/api/sync-db`).
+- Añade `MAP_SYNC_TOKEN` con un secreto aleatorio largo. No lo publiques en GitHub.
+
+### Nuevo servicio del mapa (Web Service)
+
+- Build Command: `pip install -r requirements.txt`
+- Start Command: `gunicorn --bind 0.0.0.0:$PORT dashboard:app`
+- Añade un disco persistente montado en `/data`.
+- Variables: `DB_PATH=/data/bot_sismico.db` y el mismo `MAP_SYNC_TOKEN` del Background Worker.
+- No configures `DISCORD_TOKEN` en el servicio del mapa.
+
+El bot crea una instantánea consistente con la API de backup de SQLite y la envía al endpoint autenticado `/api/sync-db`. El mapa valida la integridad y las tablas requeridas antes de reemplazar atómicamente su copia. El endpoint no permite consultas ni escrituras SQL arbitrarias.
+
+Tras desplegar ambos servicios, revisa `https://TU-MAPA.onrender.com/health`; debería devolver `ok: true` y contadores de predicciones, sismos y registros históricos. La primera sincronización se intenta al arrancar el bot y se repite cada 60 segundos.

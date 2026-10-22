@@ -1,7 +1,7 @@
-from flask import Flask, jsonify, render_template_string
-import os, sqlite3
+from flask import Flask, jsonify, render_template_string, request
+import os, sqlite3, hmac, tempfile
 from evaluator import evaluate_real, best_proximity
-app=Flask(__name__); DB_PATH=os.getenv('DB_PATH','bot_sismico.db')
+app=Flask(__name__); DB_PATH=os.getenv('DB_PATH','bot_sismico.db'); app.config['MAX_CONTENT_LENGTH']=100*1024*1024
 def db():
     c=sqlite3.connect(DB_PATH); c.row_factory=sqlite3.Row; return c
 def rows(q,a=()):
@@ -9,6 +9,52 @@ def rows(q,a=()):
 def scalar(q):
     with db() as c:
         x=c.execute(q).fetchone(); return x[0] if x else 0
+
+@app.post('/api/sync-db')
+def sync_database():
+    """Receives a consistent SQLite snapshot from the private bot worker."""
+    expected = os.getenv('MAP_SYNC_TOKEN', '')
+    supplied = request.headers.get('Authorization', '')
+    if not expected:
+        return jsonify({'ok': False, 'error': 'sync_not_configured'}), 503
+    if not hmac.compare_digest(supplied, f'Bearer {expected}'):
+        return jsonify({'ok': False, 'error': 'unauthorized'}), 401
+    uploaded = request.files.get('database')
+    if uploaded is None:
+        return jsonify({'ok': False, 'error': 'missing_database'}), 400
+
+    target_path = os.path.abspath(DB_PATH)
+    target_dir = os.path.dirname(target_path) or '.'
+    os.makedirs(target_dir, exist_ok=True)
+    temp_path = None
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix='.sismobot-sync-', suffix='.db', dir=target_dir)
+        os.close(fd)
+        uploaded.save(temp_path)
+        check = sqlite3.connect(temp_path)
+        try:
+            integrity = check.execute('PRAGMA integrity_check').fetchone()
+            tables = {r[0] for r in check.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            required = {'real_predictions', 'observed_events', 'correlation_history'}
+            if not integrity or integrity[0] != 'ok' or not required.issubset(tables):
+                return jsonify({'ok': False, 'error': 'invalid_database_snapshot'}), 400
+        finally:
+            check.close()
+        # Snapshot is generated via SQLite's backup API, so it is self-contained (no WAL sidecars).
+        os.replace(temp_path, target_path)
+        temp_path = None
+        return jsonify({'ok': True, 'message': 'database_snapshot_updated'})
+    except Exception as exc:
+        app.logger.exception('Database snapshot sync failed')
+        return jsonify({'ok': False, 'error': type(exc).__name__}), 500
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
 @app.get('/api/dashboard')
 def api_dashboard():
     es=rows("SELECT * FROM observed_events WHERE source='CSN' ORDER BY occurred_at DESC")
