@@ -19,6 +19,7 @@ from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from xml.sax.saxutils import escape as xml_escape
 
 from csn import fetch_recent_events, fetch_recent_events_debug, fetch_historical_events
 from dashboard import run_dashboard
@@ -276,6 +277,64 @@ def preds():
     with connect() as con:return con.execute("SELECT * FROM predictions WHERE group_name='PRUEBA' ORDER BY predicted_at").fetchall()
 def events():
     with connect() as con:return con.execute("SELECT * FROM observed_events WHERE source='CSN' ORDER BY occurred_at DESC").fetchall()
+
+
+def refresh_events_for_prediction_windows(predictions):
+    """Fetch CSN historical catalogues for prediction dates, in safe <=31-day chunks.
+
+    Events are inserted with INSERT OR IGNORE, preserving the existing SQLite history.
+    Returns (all_saved_events, new_event_count, errors).
+    """
+    if not predictions:
+        return events(), 0, []
+    intervals = []
+    for p in predictions:
+        try:
+            start = date.fromisoformat(str(p["date_start"]))
+            end = date.fromisoformat(str(p["date_end"]))
+        except (ValueError, TypeError, KeyError, IndexError):
+            continue
+        if end < start:
+            start, end = end, start
+        intervals.append((start, end))
+    if not intervals:
+        return events(), 0, ["No se pudieron interpretar las fechas de las predicciones."]
+
+    intervals.sort(key=lambda x: x[0])
+    merged = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1] + timedelta(days=1):
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    new_count, errors = 0, []
+    for start, end in merged:
+        chunk_start = start
+        while chunk_start <= end:
+            chunk_end = min(end, chunk_start + timedelta(days=30))
+            try:
+                fetched, fetch_errors = fetch_historical_events(chunk_start, chunk_end)
+                for event in fetched:
+                    new_count += int(save_csn_event(event))
+                errors.extend(fetch_errors)
+            except Exception as exc:
+                errors.append(f"{chunk_start:%d/%m/%Y}-{chunk_end:%d/%m/%Y}: {type(exc).__name__}: {exc}")
+            chunk_start = chunk_end + timedelta(days=1)
+    return events(), new_count, errors
+
+
+def _best_comparison_candidate(candidates):
+    """Choose the most informative real event without mislabeling it as a hit."""
+    if not candidates:
+        return None
+    def key(x):
+        passed = int(bool(x.get("t"))) + int(bool(x.get("g"))) + int(bool(x.get("m")))
+        when = parse_datetime(x["e"]["occurred_at"])
+        pred_start, pred_end = None, None
+        # Prefer candidates meeting more criteria, then nearer in space/time/magnitude.
+        return (passed, -float(x.get("dist", float("inf"))), -abs(float(x["e"]["magnitude"])))
+    return max(candidates, key=key)
 
 def evaluate(p,es,hours):
     target=datetime.fromisoformat(p["predicted_at"]);start=target-timedelta(hours=hours);end=target+timedelta(hours=hours)
@@ -1314,7 +1373,7 @@ def build_results_excel(predictions, observed):
     columns = ["Grupo", "Código", "Estado", "Fecha inicio", "Fecha fin", "Hora inicio", "Hora fin",
                "Lugar predicho", "Magnitud mín.", "Magnitud máx.", "Latitud pred.", "Longitud pred.",
                "Radio (km)", "ID sismo CSN", "Fecha sismo", "Lugar sismo", "Magnitud sismo",
-               "Distancia (km)", "Tiempo válido", "Ubicación válida", "Magnitud válida", "Enlace oficial CSN"]
+               "Distancia (km)", "Tiempo válido", "Ubicación válida", "Magnitud válida", "Enlace oficial CSN", "Relación del candidato"]
     categories = ("ACERTADA", "CASI ACERTADA", "NO ACERTADA", "PENDIENTE")
     names = {"ACERTADA": "ACERTADAS", "CASI ACERTADA": "CASI ACERTADAS",
              "NO ACERTADA": "NO ACERTADAS", "PENDIENTE": "PENDIENTES"}
@@ -1323,22 +1382,28 @@ def build_results_excel(predictions, observed):
         ws.append(columns)
     counts = {}
     for p in predictions:
-        status, match, rad, _ = evaluate_real(p, observed)
+        status, match, rad, candidates = evaluate_real(p, observed)
+        comparison = match if match is not None else _best_comparison_candidate(candidates)
         group = p["group_name"]
         if group not in counts:
             counts[group] = {key: 0 for key in categories}
         counts[group][status] += 1
-        e = match["e"] if match else None
+        e = comparison["e"] if comparison else None
+        if comparison is None:
+            relation = "Sin eventos CSN disponibles"
+        else:
+            passed = int(bool(comparison.get("t"))) + int(bool(comparison.get("g"))) + int(bool(comparison.get("m")))
+            relation = {3: "Coincidencia 3/3", 2: "Casi coincidencia 2/3", 1: "Candidato 1/3", 0: "Candidato más cercano (0/3)"}[passed]
         row = [group, p["code"], status, p["date_start"], p["date_end"],
                p["daily_time_start"], p["daily_time_end"], p["place"],
                p["mag_min"], p["mag_max"], p["latitude"], p["longitude"], rad,
                e["source_id"] if e else None, str(e["occurred_at"]) if e else None,
                e["place"] if e else None, e["magnitude"] if e else None,
-               round(match["dist"], 2) if match else None,
-               ("SÍ" if match["t"] else "NO") if match is not None else None,
-               ("SÍ" if match["g"] else "NO") if match is not None else None,
-               ("SÍ" if match["m"] else "NO") if match is not None else None,
-               e["source_url"] if e else None]
+               round(comparison["dist"], 2) if comparison else None,
+               ("SÍ" if comparison["t"] else "NO") if comparison is not None else None,
+               ("SÍ" if comparison["g"] else "NO") if comparison is not None else None,
+               ("SÍ" if comparison["m"] else "NO") if comparison is not None else None,
+               e["source_url"] if e else None, relation]
         tabs[status].append(row)
     summary.append(["Grupo", "Acertadas", "Casi acertadas", "No acertadas", "Pendientes", "Total"])
     for group in sorted(counts):
@@ -1382,13 +1447,18 @@ async def c_export_excel(i:discord.Interaction, grupo:str=None):
         if not ps:
             await i.followup.send("No hay predicciones importadas para ese grupo." if grupo else "No hay predicciones importadas. Usa `/importar_todos`.")
             return
-        output, counts = await __import__('asyncio').to_thread(build_results_excel, ps, events())
+        observed, history_new, history_errors = await __import__('asyncio').to_thread(refresh_events_for_prediction_windows, ps)
+        output, counts = await __import__('asyncio').to_thread(build_results_excel, ps, observed)
         if output.getbuffer().nbytes > 8 * 1024 * 1024:
             await i.followup.send("El Excel supera 8 MB. Prueba exportar un grupo específico con `/exportar_excel grupo:`.")
             return
         filename = "resultados_csn_" + (re.sub(r"[^a-zA-Z0-9_-]", "_", grupo.upper()) if grupo else "TODOS") + ".xlsx"
-        await i.followup.send("📊 Excel generado con las categorías actuales y un resumen por grupo.",
-                              file=discord.File(output, filename=filename))
+        note = (f"📊 Excel generado y comparado con {len(observed)} eventos CSN guardados "
+                f"({history_new} nuevos importados para las fechas de las predicciones).\n"
+                "La columna 'Relación del candidato' distingue coincidencias de simples candidatos cercanos.")
+        if history_errors:
+            note += f"\n⚠️ Avisos al consultar el histórico CSN: {len(history_errors)}. Revisa los logs si faltan fechas."
+        await i.followup.send(note, file=discord.File(output, filename=filename))
     except Exception as exc:
         await i.followup.send(f"❌ No se pudo generar el Excel: `{type(exc).__name__}: {str(exc)[:300]}`")
 
@@ -1614,12 +1684,21 @@ async def c_integrity(i:discord.Interaction):
 def _pdf_safe(value):
     if value is None:
         return "-"
-    return str(value).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    return xml_escape(str(value))
+
+
+def _pdf_link(url, label="Abrir informe CSN"):
+    """Return a clickable ReportLab link for a validated HTTP(S) URL."""
+    url = str(url or "").strip()
+    if not url.lower().startswith(("https://", "http://")):
+        return "-"
+    href = xml_escape(url, {"\"": "&quot;", "'": "&apos;"})
+    return f'<link href="{href}" color="#0563C1"><u>{xml_escape(label)}</u></link>'
 
 def build_experiment_pdf(output_path, group_name=None):
     """Genera un informe PDF usando el mismo evaluador oficial que Discord/dashboard."""
     ps=get_real_group(group_name)
-    es=events()
+    es, _new_events, _event_errors = refresh_events_for_prediction_windows(ps)
     styles=getSampleStyleSheet()
     title=ParagraphStyle("ReportTitle", parent=styles["Title"], alignment=TA_CENTER, fontSize=20, leading=24, spaceAfter=8)
     sub=ParagraphStyle("ReportSub", parent=styles["Normal"], alignment=TA_CENTER, fontSize=9, leading=12, textColor=colors.HexColor("#555555"), spaceAfter=14)
@@ -1704,15 +1783,20 @@ def build_experiment_pdf(output_path, group_name=None):
             if pred["daily_time_start"] and pred["daily_time_end"]:
                 timeband=f" {pred['daily_time_start']}-{pred['daily_time_end']}"
             window=f"{pred['date_start']} a {pred['date_end']}{timeband}"
+            comparison = b if b is not None else _best_comparison_candidate(cands)
             related="-"
-            if b:
-                e=b["e"]; when=parse_datetime(e["occurred_at"])
-                related=f"{when:%d/%m %H:%M} | M{e['magnitude']:.1f} | {b['dist']:.1f} km | {e['place']}"
+            if comparison:
+                e=comparison["e"]; when=parse_datetime(e["occurred_at"])
+                passed = int(bool(comparison.get("t"))) + int(bool(comparison.get("g"))) + int(bool(comparison.get("m")))
+                relation = {3: "3/3", 2: "2/3", 1: "1/3", 0: "0/3"}[passed]
+                related=f"{when:%d/%m %H:%M} | M{e['magnitude']:.1f} | {comparison['dist']:.1f} km | {_pdf_safe(e['place'])} | criterios {relation}"
+                if e.get("source_url"):
+                    related += " | " + _pdf_link(e["source_url"], "Abrir CSN")
             detail.append([
                 Paragraph(_pdf_safe(pred["code"]),small), Paragraph(_pdf_safe(pred["group_name"]),small),
                 Paragraph(_pdf_safe(window),small), Paragraph(_pdf_safe(pred["place"]),small),
                 f"M{pred['mag_min']:.1f}-{pred['mag_max']:.1f}", f"{rad:.0f} km", st,
-                Paragraph(_pdf_safe(related),small)
+                Paragraph(related,small)
             ])
         dt=Table(detail, colWidths=[25*mm,22*mm,39*mm,55*mm,27*mm,20*mm,27*mm,67*mm], repeatRows=1)
         dt.setStyle(TableStyle([
@@ -1752,7 +1836,7 @@ def build_experiment_pdf(output_path, group_name=None):
                 "OK" if b.get("mag_ok") else "NO",
                 "OK" if b.get("time_ok") else "NO",
                 "OK" if b.get("geo_ok") else "NO",
-                Paragraph(_pdf_safe(link),small)
+                Paragraph(_pdf_link(link, "Abrir informe CSN"),small)
             ])
         it=Table(inspect,colWidths=[30*mm,85*mm,35*mm,25*mm,25*mm,25*mm,60*mm],repeatRows=1)
         it.setStyle(TableStyle([
@@ -1783,7 +1867,7 @@ async def c_informe_pdf(i:discord.Interaction, ia:str="TODAS"):
     safe_name=re.sub(r"[^A-Za-z0-9_-]+","_",group or "TODAS")
     path=Path(tempfile.gettempdir())/f"Sismologia_Lab_{safe_name}_{datetime.now():%Y%m%d_%H%M%S}.pdf"
     try:
-        stats=build_experiment_pdf(path,group)
+        stats=await __import__("asyncio").to_thread(build_experiment_pdf,path,group)
         msg=(f"📄 **Informe PDF generado** - {group or 'TODAS LAS IA'}\n"
              f"🎯 {stats['predictions']} predicciones · ✅ {stats['hits']} aciertos · "
              f"❌ {stats['misses']} fallos · 🟡 {stats['pending']} pendientes")
